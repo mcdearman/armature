@@ -1,10 +1,13 @@
 //! A second look, built on the framework alone: square corners, hard
 //! outlines and solid offset shadows, nothing like the Neo toolkit. It shows
 //! what a toolkit has to supply: a theme, a few controls that read it, and
-//! the window's background.
+//! the window's background. The slider shows the other half of the bargain:
+//! its behaviour comes from the framework, and only its painting is written
+//! here.
 //!
 //! `cargo run -p armature --example retro`
 
+use armature::controls::{SliderLogic, SliderState};
 use armature::widgets::{column, row};
 use armature::{App, Chrome, Color, CursorIcon, Cx, DrawCx, Element, Event, EventCx, FontFamily, Key, Limits, Point, PointerButton, Rect, Scheme, Size, Status, Style, TextLayout, TextStyle, Widget};
 
@@ -110,6 +113,48 @@ impl<M: Clone + 'static> Widget<M> for PushButton<M> {
     }
 }
 
+/// A slider drawn as a block on a line. Dragging, snapping and the keyboard
+/// all come from the framework's [`SliderLogic`].
+pub struct Lever<M> {
+    logic: SliderLogic,
+    on_change: fn(f32) -> M,
+}
+
+const KNOB: f32 = 16.0;
+
+pub fn lever<M: 'static>(max: f32, value: f32, on_change: fn(f32) -> M) -> Element<M> {
+    Element::new(Lever { logic: SliderLogic { step: Some(1.0), ..SliderLogic::new(0.0..=max, value) }, on_change })
+}
+
+impl<M: 'static> Widget<M> for Lever<M> {
+    fn layout(&mut self, _cx: &mut Cx, limits: Limits) -> Size {
+        limits.resolve(Size::new(limits.max.w, 24.0))
+    }
+
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    fn draw(&self, cx: &mut DrawCx) {
+        let theme = Retro::of(cx);
+        let b = cx.bounds();
+        let held = cx.state::<SliderState>().dragging;
+        cx.scene.fill(Rect::new(b.x, b.y + b.h * 0.5 - 2.0, b.w, 4.0), 0.0, theme.ink, None);
+        let x = b.x + (b.w - KNOB) * self.logic.fraction();
+        let outline = if cx.focus_visible() || held { OUTLINE * 2.0 } else { OUTLINE };
+        cx.scene.fill(Rect::new(x, b.y, KNOB, b.h), 0.0, theme.pop, Some((outline, theme.ink)));
+    }
+
+    fn event(&mut self, cx: &mut EventCx<M>, event: &Event) -> Status {
+        let b = cx.bounds();
+        let (status, change) = self.logic.event(cx, event, b, b.x + KNOB * 0.5, b.w - KNOB);
+        if let Some(v) = change.value {
+            cx.emit((self.on_change)(v));
+        }
+        status
+    }
+}
+
 /// Paints the window's paper behind the view.
 struct Paper<M>([Element<M>; 1]);
 
@@ -139,12 +184,14 @@ impl<M: 'static> Widget<M> for Paper<M> {
 #[derive(Default)]
 pub struct Counter {
     pub count: i32,
+    pub level: f32,
 }
 
 #[derive(Clone, Debug)]
 pub enum Msg {
     Less,
     More,
+    Level(f32),
 }
 
 impl App for Counter {
@@ -155,13 +202,14 @@ impl App for Counter {
     }
 
     fn window(&self) -> armature::WindowSettings {
-        armature::WindowSettings { size: Size::new(320.0, 180.0), decorations: armature::Decorations::System, ..Default::default() }
+        armature::WindowSettings { size: Size::new(320.0, 200.0), decorations: armature::Decorations::System, ..Default::default() }
     }
 
     fn update(&mut self, m: Msg) {
         match m {
             Msg::Less => self.count -= 1,
             Msg::More => self.count += 1,
+            Msg::Level(l) => self.level = l,
         }
     }
 
@@ -173,13 +221,15 @@ impl App for Counter {
         Element::new(Paper([view]))
     }
 
-    // 24px padding; the count on the first line, the buttons 16px below it.
+    // 24px padding; the count on the first line, the buttons 16px below it,
+    // then the lever across the full width.
     fn view(&self) -> Element<Msg> {
         column()
             .padding(24.0)
             .spacing(16.0)
             .push(format!("COUNT {}", self.count))
             .push(row().spacing(16.0).push(push_button("LESS", Msg::Less)).push(push_button("MORE", Msg::More)))
+            .push(lever(10.0, self.level, Msg::Level))
             .into()
     }
 }

@@ -235,24 +235,23 @@ pub enum CursorIcon {
 /// Per-widget state that survives view rebuilds.
 #[derive(Default)]
 pub(crate) struct StateStore {
-    map: HashMap<WidgetId, Box<dyn Any>>,
+    /// One value per widget and type, so a control's behaviour and its
+    /// painting can each keep their own.
+    map: HashMap<(WidgetId, TypeId), Box<dyn Any>>,
     seen: HashSet<WidgetId>,
 }
 
 impl StateStore {
     fn get<T: Default + 'static>(&mut self, id: WidgetId) -> &mut T {
         self.seen.insert(id);
-        let entry = self.map.entry(id).or_insert_with(|| Box::new(T::default()));
-        if !entry.is::<T>() {
-            *entry = Box::new(T::default());
-        }
-        entry.downcast_mut::<T>().expect("state type checked above")
+        let entry = self.map.entry((id, TypeId::of::<T>())).or_insert_with(|| Box::new(T::default()));
+        entry.downcast_mut::<T>().expect("keyed by this type")
     }
 
     /// Forgets state for widgets that are no longer in the tree.
     pub(crate) fn sweep(&mut self, live: &HashSet<WidgetId>) {
         self.seen.clear();
-        self.map.retain(|id, _| live.contains(id));
+        self.map.retain(|(id, _), _| live.contains(id));
     }
 }
 

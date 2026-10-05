@@ -13,10 +13,12 @@
 //! Included here are the widgets that only arrange or capture, such as rows,
 //! columns, stacks and mouse areas, and the logic of controls that are hard
 //! to get right, such as the text-editing [`document`] model, without any
-//! painting.
+//! painting. [`controls`] does the same for sliders, scrolling and text
+//! fields.
 
 mod anim;
 mod app;
+pub mod controls;
 mod core;
 pub mod document;
 mod event;

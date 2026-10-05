@@ -14,7 +14,7 @@ use retro::{Counter, Retro, DEPTH};
 const W: usize = 320;
 
 fn harness() -> Harness<Counter> {
-    Harness::new(Counter::default(), Size::new(W as f32, 180.0)).expect("a GPU adapter is required for these tests")
+    Harness::new(Counter::default(), Size::new(W as f32, 200.0)).expect("a GPU adapter is required for these tests")
 }
 
 fn at(px: &[u8], x: usize, y: usize) -> [u8; 3] {
@@ -30,7 +30,7 @@ fn is(got: [u8; 3], c: Color) -> bool {
 /// The top-left corner of the first button's face: scanning along the
 /// diagonal from the window corner, past the text, to the first ink pixel.
 fn first_button(px: &[u8], theme: Retro) -> (usize, usize) {
-    let y = (60..170).find(|y| is(at(px, 30, *y), theme.ink)).expect("a button outline below the text");
+    let y = (60..150).find(|y| is(at(px, 30, *y), theme.ink)).expect("a button outline below the text");
     (24, y)
 }
 
@@ -40,7 +40,7 @@ fn the_apps_own_theme_paints_the_window_and_its_controls() {
     let theme = *h.style().get::<Retro>().expect("the style carries the app's theme");
     assert_eq!(theme, Retro::for_scheme(Scheme::Light));
     let px = h.render(1.0);
-    assert!(is(at(&px, 310, 170), theme.paper), "the window is paper");
+    assert!(is(at(&px, 310, 195), theme.paper), "the window is paper");
     let (x, y) = first_button(&px, theme);
     assert!(is(at(&px, x + 1, y + 1), theme.ink), "a hard outline");
     assert!(is(at(&px, x + 6, y + 6), theme.pop), "filled with the pop colour, got {:?}", at(&px, x + 6, y + 6));
@@ -55,8 +55,8 @@ fn the_look_follows_the_system_scheme() {
     let theme = *h.style().get::<Retro>().unwrap();
     assert_eq!(theme, Retro::for_scheme(Scheme::Dark));
     let dark = h.render(1.0);
-    assert!(is(at(&dark, 310, 170), theme.paper));
-    assert_ne!(at(&light, 310, 170), at(&dark, 310, 170));
+    assert!(is(at(&dark, 310, 195), theme.paper));
+    assert_ne!(at(&light, 310, 195), at(&dark, 310, 195));
 }
 
 #[test]
@@ -103,4 +103,27 @@ fn strings_become_labels_in_the_styles_text_colour() {
     // Somewhere in the first line of text there is ink.
     let inked = (24..200).any(|x| (24..50).any(|y| is(at(&px, x, y), theme.ink)));
     assert!(inked, "the count is drawn in ink");
+}
+
+#[test]
+fn a_slider_needs_only_painting_because_the_framework_supplies_its_behaviour() {
+    let mut h = harness();
+    let theme = Retro::for_scheme(Scheme::Light);
+    let px = h.render(1.0);
+    // The lever's line is the lowest ink in the middle of the window.
+    let y = (0..200).rev().find(|y| is(at(&px, 160, *y), theme.ink)).expect("the lever's line");
+    // The knob's centre travels from x = 32 to x = 288; the middle is 5 of 10.
+    h.click(Point::new(160.0, y as f32));
+    assert_eq!(h.app().level, 5.0);
+    h.click(Point::new(170.0, y as f32));
+    assert_eq!(h.app().level, 5.0, "snapped to whole steps");
+
+    // The click gave it focus, so the keys work too.
+    let none = Modifiers::default();
+    h.key(Key::Right, none);
+    assert_eq!(h.app().level, 6.0);
+    h.key(Key::End, none);
+    assert_eq!(h.app().level, 10.0);
+    h.key(Key::Home, none);
+    assert_eq!(h.app().level, 0.0);
 }
