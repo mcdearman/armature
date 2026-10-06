@@ -320,11 +320,11 @@ pub(crate) struct Vim {
 // ---------------------------------------------------------------------------
 // Text helpers. A position with `col == line.len()` stands for the newline.
 
-fn ch(lines: &[String], p: Pos) -> char {
+pub(super) fn ch(lines: &[String], p: Pos) -> char {
     lines[p.line][p.col..].chars().next().unwrap_or('\n')
 }
 
-fn next(lines: &[String], p: Pos) -> Option<Pos> {
+pub(super) fn next(lines: &[String], p: Pos) -> Option<Pos> {
     if p.col < lines[p.line].len() {
         Some(Pos::new(p.line, next_boundary(&lines[p.line], p.col)))
     } else if p.line + 1 < lines.len() {
@@ -334,7 +334,7 @@ fn next(lines: &[String], p: Pos) -> Option<Pos> {
     }
 }
 
-fn prev(lines: &[String], p: Pos) -> Option<Pos> {
+pub(super) fn prev(lines: &[String], p: Pos) -> Option<Pos> {
     if p.col > 0 {
         Some(Pos::new(p.line, prev_boundary(&lines[p.line], p.col)))
     } else if p.line > 0 {
@@ -348,7 +348,7 @@ fn last_col(line: &str) -> usize {
     if line.is_empty() { 0 } else { prev_boundary(line, line.len()) }
 }
 
-fn first_non_blank(line: &str) -> usize {
+pub(super) fn first_non_blank(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
@@ -457,7 +457,7 @@ fn word_back(lines: &[String], p: Pos, big: bool) -> Pos {
 
 const PAIRS: [(char, char); 4] = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
 
-fn match_bracket(lines: &[String], p: Pos) -> Option<Pos> {
+pub(super) fn match_bracket(lines: &[String], p: Pos) -> Option<Pos> {
     let c = ch(lines, p);
     let (open, close, forward) = PAIRS.iter().find_map(|&(o, cl)| {
         if c == o {
@@ -485,7 +485,7 @@ fn match_bracket(lines: &[String], p: Pos) -> Option<Pos> {
 }
 
 /// The innermost `open`/`close` pair around `p`, as the positions of the brackets.
-fn enclosing(lines: &[String], p: Pos, open: char, close: char) -> Option<(Pos, Pos)> {
+pub(super) fn enclosing(lines: &[String], p: Pos, open: char, close: char) -> Option<(Pos, Pos)> {
     let mut depth = 0;
     let mut q = p;
     let start = loop {
@@ -536,7 +536,7 @@ fn valid_register(c: char) -> bool {
 
 /// `f t F T` within a line. With `repeat`, `t`/`T` skip an adjacent match
 /// so `;` keeps moving.
-fn find_char(line: &str, col: usize, f: char, c: char, n: usize, repeat: bool) -> Option<usize> {
+pub(super) fn find_char(line: &str, col: usize, f: char, c: char, n: usize, repeat: bool) -> Option<usize> {
     let mut at = col;
     for k in 0..n {
         match f {
@@ -566,7 +566,7 @@ fn find_char(line: &str, col: usize, f: char, c: char, n: usize, repeat: bool) -
 
 /// The range (start inclusive, end exclusive) of text object `obj` around
 /// `p`, and whether it covers whole lines.
-fn text_object(lines: &[String], p: Pos, around: bool, obj: char) -> Option<(Pos, Pos, bool)> {
+pub(super) fn text_object(lines: &[String], p: Pos, around: bool, obj: char) -> Option<(Pos, Pos, bool)> {
     match obj {
         'w' | 'W' => {
             let big = obj == 'W';
@@ -639,7 +639,7 @@ fn text_object(lines: &[String], p: Pos, around: bool, obj: char) -> Option<(Pos
 
 /// Converts Vim pattern extras to Rust regex syntax: `\<` and `\>` become
 /// word boundaries, `\c` and `\C` force case (in)sensitivity.
-fn compile(pattern: &str, ignorecase: bool, smartcase: bool) -> Result<Regex, String> {
+pub(super) fn compile(pattern: &str, ignorecase: bool, smartcase: bool) -> Result<Regex, String> {
     let mut ci = ignorecase && !(smartcase && pattern.chars().any(char::is_uppercase));
     let mut out = String::new();
     let mut it = pattern.chars();

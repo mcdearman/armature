@@ -1,5 +1,8 @@
-//! The text model behind [`TextEditor`](super::TextEditor).
+//! A text-editing model: text with a cursor, a selection and undo history,
+//! with optional Vim or Helix keys. It draws nothing; an editor widget
+//! sends it [`Action`]s and paints what it reports.
 
+mod helix;
 mod vim;
 
 pub use vim::{BlockSelection, ClipboardNeed, Mode, Scroll, VimRequest, VimStatus, VimView};
@@ -40,6 +43,35 @@ pub enum Motion {
     PageDown(usize),
 }
 
+/// Which keys drive a [`Document`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Keymap {
+    /// Ordinary editing: typing inserts, arrows move.
+    #[default]
+    Plain,
+    /// Vim: operators, then motions.
+    Vim,
+    /// Helix: select, then act.
+    Helix,
+}
+
+/// What to show in a status bar for a modal [`Keymap`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModeStatus {
+    /// The mode, as that editor abbreviates it: `NORMAL`, `INS` and so on.
+    pub label: &'static str,
+    /// Typing inserts text in this mode.
+    pub insert: bool,
+    /// Keys typed so far for an unfinished command.
+    pub pending: String,
+    /// The command line while typing `:`, `/` or `?`, including the prefix.
+    pub command_line: Option<String>,
+    /// The latest message, such as "Pattern not found: foo".
+    pub message: Option<String>,
+    /// The register a macro is being recorded into.
+    pub recording: Option<char>,
+}
+
 /// An edit or cursor change. Editors send these to the application, which
 /// applies them with [`Document::apply`].
 #[derive(Clone, Debug, PartialEq)]
@@ -61,7 +93,7 @@ pub enum Action {
     Outdent,
     Undo,
     Redo,
-    /// A key press for Vim mode. Ignored unless Vim mode is on.
+    /// A key press for a modal keymap. Ignored with [`Keymap::Plain`].
     Key(crate::event::KeyEvent),
     /// The system clipboard's text, sent before a Vim command that reads
     /// the `+` register.
@@ -98,6 +130,7 @@ pub struct Document {
     /// While set, edits join the current undo step (a Vim command or insert session).
     grouped: bool,
     vim: Option<Box<vim::Vim>>,
+    helix: Option<Box<helix::Helix>>,
 }
 
 /// Spaces per indentation level. Tabs are expanded to this many spaces.
@@ -139,21 +172,57 @@ impl Default for Document {
 impl Document {
     pub fn new(text: &str) -> Self {
         let lines: Vec<String> = normalize(text).split('\n').map(str::to_owned).collect();
-        Self { lines, cursor: Pos::default(), anchor: Pos::default(), goal: None, undo: vec![], redo: vec![], last_edit: EditKind::None, revision: 0, grouped: false, vim: None }
+        Self { lines, cursor: Pos::default(), anchor: Pos::default(), goal: None, undo: vec![], redo: vec![], last_edit: EditKind::None, revision: 0, grouped: false, vim: None, helix: None }
     }
 
     /// Turns Vim-style modal editing on or off. It starts in Normal mode.
     pub fn set_vim(&mut self, on: bool) {
-        if on == self.vim.is_some() {
+        if on != self.vim.is_some() {
+            self.set_keymap(if on { Keymap::Vim } else { Keymap::Plain });
+        }
+    }
+
+    /// Chooses which keys drive the document. Modal keymaps start in
+    /// their Normal mode.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        if keymap == self.keymap() {
             return;
         }
         self.grouped = false;
-        self.vim = on.then(|| Box::new(vim::Vim::default()));
+        self.vim = None;
+        self.helix = None;
         self.anchor = self.cursor;
-        if on {
-            self.cursor = vim::normal_clamp(&self.lines, self.cursor);
-            self.anchor = self.cursor;
+        match keymap {
+            Keymap::Plain => {}
+            Keymap::Vim => {
+                self.vim = Some(Box::default());
+                self.cursor = vim::normal_clamp(&self.lines, self.cursor);
+                self.anchor = self.cursor;
+            }
+            Keymap::Helix => {
+                self.helix = Some(Box::default());
+                helix::Helix::start(self);
+            }
         }
+    }
+
+    pub fn keymap(&self) -> Keymap {
+        if self.vim.is_some() {
+            Keymap::Vim
+        } else if self.helix.is_some() {
+            Keymap::Helix
+        } else {
+            Keymap::Plain
+        }
+    }
+
+    /// Mode, pending keys, command line and messages for a status bar,
+    /// with a modal keymap.
+    pub fn mode_status(&self) -> Option<ModeStatus> {
+        if let Some(h) = &self.helix {
+            return Some(h.status());
+        }
+        self.vim().map(|v| ModeStatus { label: v.mode.label(), insert: v.mode == Mode::Insert, pending: v.pending, command_line: v.command_line, message: v.message, recording: v.recording })
     }
 
     /// Vim mode, pending keys, command line and messages, when Vim is on.
@@ -161,29 +230,41 @@ impl Document {
         self.vim.as_ref().map(|v| v.status())
     }
 
-    /// Commands such as `:w` and `:q` that the application should carry out.
+    /// Commands such as `:w` and `:q`, from either modal keymap, that the
+    /// application should carry out.
     pub fn take_vim_requests(&mut self) -> Vec<VimRequest> {
+        if let Some(h) = self.helix.as_mut() {
+            return h.take_requests();
+        }
         self.vim.as_mut().map(|v| v.take_requests()).unwrap_or_default()
     }
 
     /// The range to highlight as selected. The flag is true for whole-line
     /// selections (Vim's Visual Line mode).
     pub fn display_selection(&self) -> Option<(Pos, Pos, bool)> {
+        if let Some(h) = &self.helix {
+            return h.display_selection(self);
+        }
         match &self.vim {
             Some(v) => v.display_selection(self),
             None => self.selection().map(|(a, b)| (a, b, false)),
         }
     }
 
-    /// Vim state the editor widget needs: block selections, clipboard
-    /// traffic, scroll requests and the last known viewport.
+    /// What an editor widget needs from a modal keymap: block selections,
+    /// clipboard traffic, scroll requests and the last known viewport.
+    /// `None` with [`Keymap::Plain`].
     pub fn vim_view(&self) -> Option<VimView> {
+        if let Some(h) = &self.helix {
+            return Some(h.view());
+        }
         self.vim.as_ref().map(|v| v.view(self))
     }
 
-    /// Whether the caret should be drawn as a block (Vim Normal and Visual modes).
+    /// Whether the caret should be drawn as a block, as modal keymaps do
+    /// outside their Insert mode.
     pub fn block_caret(&self) -> bool {
-        self.vim.as_ref().is_some_and(|v| v.block_caret())
+        self.vim.as_ref().is_some_and(|v| v.block_caret()) || self.helix.as_ref().is_some_and(|h| h.block_caret())
     }
 
     /// The whole text, lines joined with `\n`.
@@ -232,6 +313,14 @@ impl Document {
 
     /// Applies an action. Returns true when the text changed.
     pub fn apply(&mut self, action: Action) -> bool {
+        if let Some(mut helix) = self.helix.take() {
+            let before = self.revision;
+            let handled = helix.intercept(self, &action);
+            self.helix = Some(helix);
+            if handled {
+                return self.revision != before;
+            }
+        }
         if let Some(mut vim) = self.vim.take() {
             let before = self.revision;
             let handled = vim.intercept(self, &action);
