@@ -268,8 +268,11 @@ impl<A: App> Shell<A> {
             if old.map(|o| o.visible) != Some(state.visible) {
                 gpu.window.set_visible(state.visible);
                 if state.visible {
-                    // Windows shown from a global shortcut should come to the front.
-                    gpu.window.focus_window();
+                    // Windows shown from a global shortcut should come to the
+                    // front; ones that appear on their own should not take over.
+                    if !state.passive {
+                        gpu.window.focus_window();
+                    }
                     gpu.window.request_redraw();
                 }
             }

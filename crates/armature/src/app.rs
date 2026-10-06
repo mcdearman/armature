@@ -165,11 +165,15 @@ pub struct WindowState {
     /// Leave the window out of screenshots and screen recordings, where the
     /// platform can.
     pub hidden_from_capture: bool,
+    /// Show the window without giving it the keyboard, so whatever the
+    /// user is typing into keeps it. For things that appear on their own,
+    /// such as a notification.
+    pub passive: bool,
 }
 
 impl Default for WindowState {
     fn default() -> Self {
-        Self { visible: true, always_on_top: false, bare: false, size: None, position: None, hidden_from_capture: false }
+        Self { visible: true, always_on_top: false, bare: false, size: None, position: None, hidden_from_capture: false, passive: false }
     }
 }
 
