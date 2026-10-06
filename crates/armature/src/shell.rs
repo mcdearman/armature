@@ -553,6 +553,7 @@ fn cursor_icon(c: CursorIcon) -> winit::window::CursorIcon {
         CursorIcon::Text => W::Text,
         CursorIcon::Grab => W::Grab,
         CursorIcon::Grabbing => W::Grabbing,
+        CursorIcon::Crosshair => W::Crosshair,
         CursorIcon::Resize(e) => match e {
             ResizeEdge::North | ResizeEdge::South => W::NsResize,
             ResizeEdge::East | ResizeEdge::West => W::EwResize,

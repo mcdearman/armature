@@ -229,6 +229,8 @@ pub enum CursorIcon {
     Text,
     Grab,
     Grabbing,
+    /// For picking out a point or dragging out an area.
+    Crosshair,
     Resize(ResizeEdge),
 }
 
