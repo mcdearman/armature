@@ -651,6 +651,11 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 self.modifiers = m.state();
                 let mods = self.modifiers();
                 self.ui.set_modifiers(mods);
+                // Widgets hear of it as the pointer arriving where it
+                // already is, with the new keys held.
+                if let Some(pos) = self.ui.pointer() {
+                    self.dispatch(Event::PointerMoved { pos });
+                }
             }
             WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } if self.resizing.is_some() => {
                 let Some(r) = &self.resizing else { return };

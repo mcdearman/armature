@@ -179,6 +179,13 @@ impl<A: App> Ui<A> {
         self.rt.modifiers = m;
     }
 
+    /// Where the pointer last was, if it is over the window. A key going
+    /// down can change what the pointer means where it is, so whoever
+    /// reports a change of modifiers follows it with a move to this place.
+    pub fn pointer(&self) -> Option<Point> {
+        self.rt.pointer
+    }
+
     /// Lets widgets read the system clipboard on demand.
     pub fn set_clipboard_reader(&mut self, reader: Box<dyn FnMut() -> Option<String>>) {
         self.rt.clipboard_reader = Some(reader);

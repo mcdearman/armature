@@ -108,6 +108,9 @@ impl<A: App> Harness<A> {
     /// The modifier keys held during the pointer events that follow.
     pub fn set_modifiers(&mut self, m: Modifiers) {
         self.ui.set_modifiers(m);
+        if let Some(pos) = self.ui.pointer() {
+            self.event(Event::PointerMoved { pos });
+        }
     }
 
     pub fn set_clipboard(&mut self, text: &str) {
