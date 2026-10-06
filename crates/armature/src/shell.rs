@@ -294,22 +294,41 @@ impl<A: App> Shell<A> {
     fn sync_menus(&mut self) {
         use muda::{MenuItem, PredefinedMenuItem, Submenu};
         for id in self.menu_events.try_iter().collect::<Vec<_>>() {
-            let mut parts = id.strip_prefix("armature:").into_iter().flat_map(|r| r.split(':')).map(str::parse::<usize>);
-            if let (Some(Ok(menu)), Some(Ok(entry))) = (parts.next(), parts.next()) {
-                self.ui.choose_menu(menu, entry);
+            let Some(rest) = id.strip_prefix("armature:") else { continue };
+            let mut parts = rest.split(':');
+            match (parts.next(), parts.next().map(str::parse::<usize>)) {
+                (Some("app"), Some(Ok(entry))) => self.ui.choose_app_menu(entry),
+                (Some(menu), Some(Ok(entry))) => {
+                    if let Ok(menu) = menu.parse() {
+                        self.ui.choose_menu(menu, entry);
+                    }
+                }
+                _ => {}
             }
         }
         let menus = self.ui.menus();
-        let signature = crate::menu::signature(&menus);
+        let own = self.ui.app_menu();
+        // The app's own entries count as a menu when checking for changes.
+        let signature = crate::menu::signature(&menus) ^ crate::menu::signature(&[crate::Menu { title: "app".into(), entries: own.clone() }]).rotate_left(1);
         if self.menu.as_ref().is_some_and(|(s, _)| *s == signature) {
             return;
         }
         let bar = muda::Menu::new();
         // The first menu is the app's own; macOS titles it with the app's name.
         let app = Submenu::new("App", true);
+        let entry_item = |id: String, entry: &crate::MenuEntry<A::Message>| {
+            let keys = entry.shortcut.as_ref().and_then(|s| s.accelerator().parse().ok());
+            MenuItem::with_id(id, &entry.label, entry.message.is_some(), keys)
+        };
+        let _ = app.append_items(&[&PredefinedMenuItem::about(None, None), &PredefinedMenuItem::separator()]);
+        // Settings and the like go here, under the app's name.
+        for (e, item) in own.iter().enumerate() {
+            let _ = if item.separator { app.append(&PredefinedMenuItem::separator()) } else { app.append(&entry_item(format!("armature:app:{e}"), item)) };
+        }
+        if !own.is_empty() {
+            let _ = app.append(&PredefinedMenuItem::separator());
+        }
         let _ = app.append_items(&[
-            &PredefinedMenuItem::about(None, None),
-            &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::hide(None),
             &PredefinedMenuItem::hide_others(None),
             &PredefinedMenuItem::show_all(None),
@@ -323,8 +342,7 @@ impl<A: App> Shell<A> {
                 let _ = if entry.separator {
                     sub.append(&PredefinedMenuItem::separator())
                 } else {
-                    let keys = entry.shortcut.as_ref().and_then(|s| s.accelerator().parse().ok());
-                    sub.append(&MenuItem::with_id(format!("armature:{m}:{e}"), &entry.label, entry.message.is_some(), keys))
+                    sub.append(&entry_item(format!("armature:{m}:{e}"), entry))
                 };
             }
             let _ = bar.append(&sub);

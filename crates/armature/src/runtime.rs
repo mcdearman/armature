@@ -148,6 +148,19 @@ impl<A: App> Ui<A> {
         self.app.menus()
     }
 
+    /// The app's entries for the application menu.
+    pub fn app_menu(&self) -> Vec<crate::MenuEntry<A::Message>> {
+        self.app.app_menu()
+    }
+
+    /// Chooses an entry of the application menu, as the system's menu bar does.
+    pub fn choose_app_menu(&mut self, entry: usize) {
+        if let Some(m) = self.app.app_menu().get(entry).and_then(|e| e.message.clone()) {
+            self.app.update(m);
+            self.needs_view = true;
+        }
+    }
+
     /// Chooses an entry of the app's menus, as the system's menu bar does.
     pub fn choose_menu(&mut self, menu: usize, entry: usize) {
         if let Some(m) = self.app.menus().get(menu).and_then(|m| m.entries.get(entry)).and_then(|e| e.message.clone()) {
@@ -297,7 +310,7 @@ impl<A: App> Ui<A> {
             && k.pressed
         {
             // A menu entry's shortcut comes first, then the app's own keys.
-            if let Some(m) = crate::menu::shortcut_message(&self.app.menus(), k).or_else(|| self.app.on_key(k)) {
+            if let Some(m) = crate::menu::shortcut_message(&crate::menu::with_app_entries(self.app.menus(), self.app.app_menu()), k).or_else(|| self.app.on_key(k)) {
                 messages.push(m);
             } else if k.key == Key::Tab {
                 self.move_focus(!k.modifiers.shift);

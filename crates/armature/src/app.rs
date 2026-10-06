@@ -53,6 +53,13 @@ pub trait App: 'static {
         vec![]
     }
 
+    /// Entries about the app as a whole, such as Settings. On macOS they go
+    /// in the application menu, under the app's name; other systems have
+    /// no such menu, so there they follow the entries of the first menu.
+    fn app_menu(&self) -> Vec<crate::MenuEntry<Self::Message>> {
+        vec![]
+    }
+
     /// Key presses no widget handled, for app-wide shortcuts such as save.
     fn on_key(&self, _key: &KeyEvent) -> Option<Self::Message> {
         None

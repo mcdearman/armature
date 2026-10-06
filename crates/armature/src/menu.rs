@@ -132,6 +132,25 @@ impl<M> Menu<M> {
     }
 }
 
+/// The menus to draw in a window: `menus`, with the app's own entries (see
+/// [`App::app_menu`](crate::App::app_menu)) at the end of the first one,
+/// which is where systems without an application menu keep Settings.
+pub fn with_app_entries<M>(mut menus: Vec<Menu<M>>, app: Vec<MenuEntry<M>>) -> Vec<Menu<M>> {
+    if app.is_empty() {
+        return menus;
+    }
+    match menus.first_mut() {
+        Some(first) => {
+            if !first.entries.is_empty() {
+                first.entries.push(MenuEntry::separator());
+            }
+            first.entries.extend(app);
+        }
+        None => menus.push(Menu { title: "File".into(), entries: app }),
+    }
+    menus
+}
+
 /// The message of the first enabled entry whose shortcut is this key press.
 pub(crate) fn shortcut_message<M: Clone>(menus: &[Menu<M>], k: &KeyEvent) -> Option<M> {
     menus.iter().flat_map(|m| &m.entries).find(|e| e.shortcut.as_ref().is_some_and(|s| s.matches(k))).and_then(|e| e.message.clone())
@@ -180,6 +199,28 @@ mod tests {
         let s = Shortcut::command("o").shift();
         assert_eq!(s.label(), if cfg!(target_os = "macos") { "⇧⌘O" } else { "Ctrl+Shift+O" });
         assert_eq!(s.accelerator(), "CmdOrCtrl+Shift+O");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_menu_bar_understands_the_shortcuts() {
+        for s in [Shortcut::command("o"), Shortcut::command(","), Shortcut::command("z").shift(), Shortcut::command("=").alt(), Shortcut::command("1")] {
+            assert!(s.accelerator().parse::<muda::accelerator::Accelerator>().is_ok(), "{}", s.accelerator());
+        }
+    }
+
+    #[test]
+    fn app_entries_join_the_first_menu_where_there_is_no_application_menu() {
+        let settings = || vec![MenuEntry::new("Settings…", 9).shortcut(Shortcut::command(","))];
+        let merged = with_app_entries(vec![Menu::new("File").push(MenuEntry::new("Open", 1)), Menu::new("View")], settings());
+        let labels: Vec<&str> = merged[0].entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["Open", "", "Settings…"], "after a separator");
+        assert!(merged[0].entries[1].separator && merged[1].entries.is_empty());
+        // An app with no menus of its own still gets somewhere to put them.
+        let alone = with_app_entries(vec![], settings());
+        assert_eq!((alone.len(), alone[0].title.as_str(), alone[0].entries.len()), (1, "File", 1));
+        assert_eq!(shortcut_message(&alone, &press(",", false)), Some(9));
+        assert!(with_app_entries(Vec::<Menu<i32>>::new(), vec![]).is_empty());
     }
 
     #[test]
