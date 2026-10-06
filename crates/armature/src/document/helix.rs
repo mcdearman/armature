@@ -84,6 +84,8 @@ impl HKey {
                 })
             }
             Key::Character(c) => HKey::Char(typed().or_else(|| c.chars().next())?),
+            // Function keys are the application's, not the editor's.
+            Key::F(_) => return None,
             Key::Other => HKey::Char(typed()?),
         })
     }

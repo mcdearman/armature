@@ -180,6 +180,8 @@ impl VKey {
                 if c == '[' || c == 'c' { VKey::Esc } else { VKey::Ctrl(c) }
             }
             Key::Character(c) => VKey::Char(k.text.as_deref().and_then(|t| t.chars().next()).or_else(|| c.chars().next())?),
+            // Function keys are the application's, not the editor's.
+            Key::F(_) => return None,
             Key::Other => VKey::Char(k.text.as_deref()?.chars().next()?),
         })
     }

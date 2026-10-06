@@ -44,6 +44,8 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// A function key: `F(5)` is F5.
+    F(u8),
     /// A printable key, lower-cased where the platform reports it that way.
     Character(String),
     Other,
