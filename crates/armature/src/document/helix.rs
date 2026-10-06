@@ -7,8 +7,9 @@
 //! surround under `m`, `d c y p P R r ~ > < J`, undo and redo, regex search,
 //! named registers, the system clipboard under Space, and `:w` and `:q`.
 //!
-//! A document has one selection, so Helix's multiple selections (`C`, `s`,
-//! `S`, `,` and friends) are not available; those keys say so.
+//! There can be several selections at once. Every motion and change then
+//! applies to each of them, and `C`, `s`, `S`, `Alt-s`, `,`, `Alt-,`, `(`,
+//! `)` and `_` make and manage them. Selections that come to overlap merge.
 //!
 //! While this is on, the document's cursor and anchor are the two end
 //! characters of the selection, both included, rather than the gaps between
@@ -17,7 +18,7 @@
 use std::collections::HashMap;
 
 use super::vim::{ch, compile, enclosing, find_char, first_non_blank, match_bracket, next, prev, text_object, ClipboardNeed, Scroll, VimRequest, VimView};
-use super::{normalize, prev_boundary, text_between, Action, Document, EditKind, ModeStatus, Motion, Pos, INDENT};
+use super::{normalize, prev_boundary, text_between, Action, Document, EditKind, ExtraSelection, ModeStatus, Motion, Pos, Sel, INDENT};
 use crate::event::{Key, KeyEvent};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -106,7 +107,11 @@ pub(crate) struct Helix {
     count: Option<usize>,
     /// The register named with `"` for the next command.
     register: Option<char>,
-    registers: HashMap<char, String>,
+    /// What was yanked: one piece of text per selection, in document order.
+    registers: HashMap<char, Vec<String>>,
+    /// Where the selection being worked on comes among them all, which
+    /// picks the piece of a register it pastes.
+    rank: usize,
     search: Option<String>,
     cmdline: Option<(char, String)>,
     message: Option<String>,
@@ -270,10 +275,9 @@ fn paragraph(lines: &[String], line: usize, around: bool) -> (usize, usize) {
     (a, b)
 }
 
-const NO_MULTI: &str = "Multiple selections are not supported";
 
 impl Helix {
-    pub(crate) fn status(&self) -> ModeStatus {
+    pub(crate) fn status(&self, doc: &Document) -> ModeStatus {
         let mut pending: String = self.count.map(|c| c.to_string()).unwrap_or_default();
         if let Some(r) = self.register {
             pending.push('"');
@@ -288,9 +292,14 @@ impl Helix {
             },
             insert: self.mode == Mode::Insert,
             pending,
-            command_line: self.cmdline.as_ref().map(|(p, s)| format!("{p}{s}")),
+            command_line: self.cmdline.as_ref().map(|(p, s)| match p {
+                's' => format!("select:{s}"),
+                'S' => format!("split:{s}"),
+                _ => format!("{p}{s}"),
+            }),
             message: self.message.clone(),
             recording: None,
+            selections: doc.others.len() + 1,
         }
     }
 
@@ -324,6 +333,23 @@ impl Helix {
         })
     }
 
+    pub(crate) fn extras(&self, doc: &Document) -> Vec<ExtraSelection> {
+        doc.others
+            .iter()
+            .map(|o| {
+                let (lo, hi) = (o.cursor.min(o.anchor), o.cursor.max(o.anchor));
+                let range = if lo == hi {
+                    None
+                } else if self.mode == Mode::Insert {
+                    Some((lo, hi))
+                } else {
+                    Some((lo, next(&doc.lines, hi).unwrap_or(hi)))
+                };
+                ExtraSelection { cursor: o.cursor, range }
+            })
+            .collect()
+    }
+
     /// Called when Helix mode is switched on.
     pub(crate) fn start(doc: &mut Document) {
         doc.cursor = doc.clamp(doc.cursor);
@@ -348,10 +374,12 @@ impl Helix {
                 self.view_lines = *lines;
                 true
             }
-            // In Insert mode the pointer and shortcuts behave as in a plain editor.
-            _ if self.mode == Mode::Insert => false,
             Action::Click { pos, select } => {
                 self.reset();
+                doc.others.clear();
+                if self.mode == Mode::Insert {
+                    return false;
+                }
                 let p = doc.clamp(*pos);
                 doc.cursor = p;
                 if !*select {
@@ -360,40 +388,73 @@ impl Helix {
                 true
             }
             Action::Drag(pos) => {
+                if self.mode == Mode::Insert {
+                    return false;
+                }
                 doc.cursor = doc.clamp(*pos);
+                self.finish(doc);
                 true
             }
             Action::SelectWord(pos) => {
+                doc.others.clear();
                 doc.apply_plain(Action::SelectWord(*pos));
-                from_gaps(doc);
+                if self.mode != Mode::Insert {
+                    from_gaps(doc);
+                }
                 true
             }
             Action::SelectAll => {
+                if self.mode == Mode::Insert {
+                    doc.others.clear();
+                    return false;
+                }
                 self.select_all(doc);
                 true
             }
             Action::Collapse => {
-                doc.anchor = doc.cursor;
+                self.each(doc, |_, doc| doc.anchor = doc.cursor);
                 true
             }
             Action::Move { .. } => {
+                doc.others.clear();
+                if self.mode == Mode::Insert {
+                    return false;
+                }
                 doc.anchor = doc.cursor;
                 doc.apply_plain(action.clone());
                 doc.cursor = doc.clamp(doc.cursor);
                 doc.anchor = doc.cursor;
                 true
             }
-            // Edits from menus and shortcuts act on the selection as shown.
-            Action::Insert(_) | Action::Enter | Action::Backspace | Action::Delete | Action::Indent | Action::Outdent => {
-                to_gaps(doc);
-                doc.apply_plain(action.clone());
-                doc.cursor = doc.clamp(doc.cursor);
-                doc.anchor = doc.cursor;
+            // Edits from menus and shortcuts act on every selection as shown.
+            Action::Insert(_) | Action::Enter | Action::Backspace | Action::Delete => {
+                let normal = self.mode != Mode::Insert;
+                self.each(doc, |_, doc| {
+                    if normal {
+                        to_gaps(doc);
+                    }
+                    plain(doc, action.clone());
+                    if normal {
+                        doc.cursor = doc.clamp(doc.cursor);
+                        doc.anchor = doc.cursor;
+                    }
+                });
+                self.finish(doc);
+                true
+            }
+            Action::Indent | Action::Outdent => {
+                if self.mode == Mode::Insert {
+                    doc.others.clear();
+                    return false;
+                }
+                self.indent(doc, 1, matches!(action, Action::Indent));
+                self.finish(doc);
                 true
             }
             Action::Undo | Action::Redo => {
+                doc.grouped = false;
                 doc.apply_plain(action.clone());
-                settle(doc);
+                self.finish(doc);
                 true
             }
         }
@@ -410,10 +471,142 @@ impl Helix {
         self.message = Some(m.into());
     }
 
+    /// Runs `f` for the main selection and then for each of the others,
+    /// with that selection in the document's cursor and anchor.
+    fn each(&mut self, doc: &mut Document, mut f: impl FnMut(&mut Self, &mut Document)) {
+        let ranks = order(doc);
+        self.rank = ranks[0];
+        f(self, doc);
+        for k in 0..doc.others.len() {
+            self.swap(doc, k);
+            self.rank = ranks[k + 1];
+            f(self, doc);
+            self.swap(doc, k);
+        }
+        self.rank = ranks[0];
+    }
+
+    /// Exchanges the main selection with another, so commands written for
+    /// one selection can work on any of them.
+    fn swap(&mut self, doc: &mut Document, k: usize) {
+        let other = doc.others[k];
+        doc.others[k] = Sel { anchor: doc.anchor, cursor: doc.cursor, goal: self.goal };
+        doc.anchor = other.anchor;
+        doc.cursor = other.cursor;
+        self.goal = other.goal;
+    }
+
+    /// Tidies up after a command: closes its undo step, keeps every
+    /// selection on real positions, and merges any that now overlap.
+    fn finish(&mut self, doc: &mut Document) {
+        if self.mode != Mode::Insert {
+            doc.grouped = false;
+        }
+        settle(doc);
+        if doc.others.is_empty() {
+            return;
+        }
+        let mut all: Vec<(Sel, bool)> = vec![(Sel { anchor: doc.anchor, cursor: doc.cursor, goal: self.goal }, true)];
+        all.extend(doc.others.drain(..).map(|o| (o, false)));
+        all.sort_by_key(|(s, _)| s.anchor.min(s.cursor));
+        let mut merged: Vec<(Sel, bool)> = Vec::with_capacity(all.len());
+        for (sel, main) in all {
+            let (lo, hi) = (sel.anchor.min(sel.cursor), sel.anchor.max(sel.cursor));
+            if let Some((last, last_main)) = merged.last_mut() {
+                let (start, end) = (last.anchor.min(last.cursor), last.anchor.max(last.cursor));
+                if lo <= end {
+                    let end = end.max(hi);
+                    *last = if last.cursor >= last.anchor { Sel { anchor: start, cursor: end, ..*last } } else { Sel { anchor: end, cursor: start, ..*last } };
+                    *last_main |= main;
+                    continue;
+                }
+            }
+            merged.push((sel, main));
+        }
+        for (sel, main) in merged {
+            if main {
+                doc.anchor = sel.anchor;
+                doc.cursor = sel.cursor;
+                self.goal = sel.goal;
+            } else {
+                doc.others.push(sel);
+            }
+        }
+    }
+
+    /// Whether a key finishes a command that every selection carries out,
+    /// as opposed to one that happens once: a prefix, a count, a prompt, or
+    /// a command about the selections themselves.
+    fn for_each_selection(&self, key: HKey) -> bool {
+        if self.mode == Mode::Insert {
+            return true;
+        }
+        let HKey::Char(c) = key else {
+            return self.pending.is_empty() && !matches!(key, HKey::Esc | HKey::Alt('s' | 'C' | ','));
+        };
+        match self.pending.as_slice() {
+            [] => {
+                let digit = c.is_ascii_digit() && (c != '0' || self.count.is_some());
+                !digit && !matches!(c, 'g' | 'm' | 'z' | ' ' | '"' | 'f' | 't' | 'F' | 'T' | 'r' | 'v' | ':' | '/' | '?' | 'u' | 'U' | 'n' | 'N' | '*' | '%' | '>' | '<' | 'y' | 'C' | 's' | 'S' | ',' | '(' | ')' | '&')
+            }
+            [HKey::Char('g' | 'f' | 't' | 'F' | 'T' | 'r'), ..] => true,
+            [HKey::Char(' ')] => matches!(c, 'p' | 'P' | 'R'),
+            [HKey::Char('m')] => c == 'm',
+            [HKey::Char('m'), HKey::Char('r')] => false,
+            [HKey::Char('m'), ..] => true,
+            _ => false,
+        }
+    }
+
+    /// Yanking takes every selection at once, so it happens before the
+    /// command runs for each of them.
+    fn yank_first(&mut self, doc: &Document, key: HKey) {
+        if self.mode == Mode::Insert {
+            return;
+        }
+        let to_clipboard = match (self.pending.as_slice(), key) {
+            ([], HKey::Char('y' | 'd' | 'c')) => false,
+            ([HKey::Char(' ')], HKey::Char('y')) => true,
+            _ => return,
+        };
+        let mut spans: Vec<(Pos, Pos)> = std::iter::once((doc.anchor, doc.cursor)).chain(doc.others.iter().map(|o| (o.anchor, o.cursor))).map(|(a, c)| (a.min(c), a.max(c))).collect();
+        spans.sort();
+        let texts: Vec<String> = spans.into_iter().map(|(lo, hi)| text_between(&doc.lines, lo, next(&doc.lines, hi).unwrap_or(hi))).collect();
+        if to_clipboard {
+            self.serial += 1;
+            self.clipboard_out = Some((self.serial, texts.join("\n")));
+        } else {
+            self.registers.insert(self.register.unwrap_or('"'), texts);
+        }
+    }
+
     fn key(&mut self, doc: &mut Document, key: HKey) {
         if self.cmdline.is_some() {
-            return self.command_key(doc, key);
+            self.command_key(doc, key);
+            return self.finish(doc);
         }
+        self.yank_first(doc, key);
+        if self.for_each_selection(key) && !doc.others.is_empty() {
+            // Each selection starts from the same pending keys and count.
+            let before = (self.mode, self.pending.clone(), self.count, self.register);
+            let mut after = before.clone();
+            let mut first = true;
+            self.each(doc, |this, doc| {
+                (this.mode, this.pending, this.count, this.register) = before.clone();
+                this.key_one(doc, key);
+                if std::mem::take(&mut first) {
+                    after = (this.mode, this.pending.clone(), this.count, this.register);
+                }
+            });
+            (self.mode, self.pending, self.count, self.register) = after;
+        } else {
+            self.rank = order(doc)[0];
+            self.key_one(doc, key);
+        }
+        self.finish(doc);
+    }
+
+    fn key_one(&mut self, doc: &mut Document, key: HKey) {
         if self.mode == Mode::Insert {
             return self.insert_key(doc, key);
         }
@@ -495,15 +688,11 @@ impl Helix {
             HKey::Char('o') => self.open_line(doc, true),
             HKey::Char('O') => self.open_line(doc, false),
 
-            HKey::Char('d') => self.delete(doc, true),
-            HKey::Alt('d') => self.delete(doc, false),
-            HKey::Char('c') => self.change(doc, true),
-            HKey::Alt('c') => self.change(doc, false),
-            HKey::Char('y') => {
-                let text = selected(doc);
-                self.yank(text);
-                self.say("Yanked the selection");
-            }
+            // `d`, `c` and `y` have already yanked; the Alt forms do not.
+            HKey::Char('d') | HKey::Alt('d') => self.delete(doc),
+            HKey::Char('c') | HKey::Alt('c') => self.change(doc),
+            HKey::Char('y') => self.say(if doc.others.is_empty() { "Yanked the selection".to_owned() } else { format!("Yanked {} selections", doc.others.len() + 1) }),
+            HKey::Char('_') => trim(doc),
             HKey::Char('p') => {
                 let text = self.register_text();
                 self.paste(doc, text, true, n);
@@ -525,16 +714,16 @@ impl Helix {
             HKey::Char('<') => self.indent(doc, n, false),
             HKey::Char('J') => self.join(doc),
             HKey::Char('u') => {
+                doc.grouped = false;
                 for _ in 0..n {
                     doc.step(true);
                 }
-                settle(doc);
             }
             HKey::Char('U') => {
+                doc.grouped = false;
                 for _ in 0..n {
                     doc.step(false);
                 }
-                settle(doc);
             }
 
             HKey::Char(c @ ('/' | '?' | ':')) => self.cmdline = Some((c, String::new())),
@@ -555,7 +744,16 @@ impl Helix {
                 self.search = Some(pattern);
             }
 
-            HKey::Char('C' | 's' | 'S' | ',' | '&' | '(' | ')') | HKey::Alt('s' | 'C' | ',' | '(' | ')') => self.say(NO_MULTI),
+            // Making and managing selections.
+            HKey::Char('C') => self.copy_to_lines(doc, n, true),
+            HKey::Alt('C') => self.copy_to_lines(doc, n, false),
+            HKey::Char(c @ ('s' | 'S')) => self.cmdline = Some((c, String::new())),
+            HKey::Alt('s') => self.select_matches(doc, r"\n", true),
+            HKey::Char(',') => doc.others.clear(),
+            HKey::Alt(',') => self.drop_main(doc),
+            HKey::Char(')') => self.rotate(doc, n as isize),
+            HKey::Char('(') => self.rotate(doc, -(n as isize)),
+            HKey::Char('&') => self.say("Aligning selections is not supported"),
             _ => {}
         }
         self.count = None;
@@ -611,6 +809,7 @@ impl Helix {
     }
 
     fn select_all(&mut self, doc: &mut Document) {
+        doc.others.clear();
         doc.anchor = Pos::new(0, 0);
         doc.cursor = doc_end(&doc.lines);
     }
@@ -687,11 +886,8 @@ impl Helix {
                 }
             }
             (HKey::Char(' '), _) => match c {
-                'y' => {
-                    self.serial += 1;
-                    self.clipboard_out = Some((self.serial, selected(doc)));
-                    self.say("Yanked the selection to the system clipboard");
-                }
+                // The yank itself happened before this, for every selection.
+                'y' => self.say("Yanked the selection to the system clipboard"),
                 'p' | 'P' => {
                     let text = self.clipboard_in.clone();
                     self.paste(doc, text, c == 'p', n);
@@ -730,7 +926,6 @@ impl Helix {
                         // Later first, so the earlier position stays valid.
                         remove_char(doc, b);
                         remove_char(doc, a);
-                        settle(doc);
                     }
                     None => self.say(format!("No surrounding '{c}'")),
                 },
@@ -749,7 +944,6 @@ impl Helix {
                         edit(doc);
                         set_char(doc, b, close);
                         set_char(doc, a, open);
-                        settle(doc);
                     }
                     None => self.say(format!("No surrounding '{from}'")),
                 }
@@ -775,42 +969,35 @@ impl Helix {
 
     // --- Changing ----------------------------------------------------------
 
-    fn yank(&mut self, text: String) {
-        self.registers.insert(self.register.unwrap_or('"'), text);
-    }
-
+    /// The piece of the register that this selection pastes: its own if
+    /// there is one for each, otherwise the last.
     fn register_text(&mut self) -> Option<String> {
         let r = self.register.unwrap_or('"');
-        let text = self.registers.get(&r).cloned();
+        let text = self.registers.get(&r).and_then(|v| v.get(self.rank).or(v.last())).cloned();
         if text.is_none() {
             self.say(format!("Register '{r}' is empty"));
         }
         text
     }
 
-    fn delete(&mut self, doc: &mut Document, yank: bool) {
-        if yank {
-            self.yank(selected(doc));
-        }
+    fn delete(&mut self, doc: &mut Document) {
         edit(doc);
         remove(doc);
-        settle(doc);
         self.mode = Mode::Normal;
     }
 
-    fn change(&mut self, doc: &mut Document, yank: bool) {
-        if yank {
-            self.yank(selected(doc));
-        }
+    fn change(&mut self, doc: &mut Document) {
         let (lo, hi) = sel(doc);
         let whole = lo.col == 0 && hi.col == doc.lines[hi.line].len();
-        begin_insert(doc);
+        edit(doc);
         if whole {
             // Changing whole lines leaves one empty line, indented like the first.
-            let indent = first_non_blank(&doc.lines[lo.line]);
-            doc.anchor = Pos::new(lo.line, indent);
-            doc.cursor = hi;
-            doc.delete_selection();
+            let from = Pos::new(lo.line, first_non_blank(&doc.lines[lo.line]));
+            tracked(doc, Some(from), hi, false, |doc| {
+                doc.anchor = from;
+                doc.cursor = hi;
+                doc.delete_selection();
+            });
         } else {
             remove(doc);
         }
@@ -828,15 +1015,15 @@ impl Helix {
         let (lo, hi) = sel(doc);
         let line = if below { hi.line } else { lo.line };
         let indent = " ".repeat(first_non_blank(&doc.lines[line]));
-        begin_insert(doc);
-        if below {
-            doc.cursor = Pos::new(line, doc.lines[line].len());
-            doc.anchor = doc.cursor;
-            doc.insert(&format!("\n{indent}"));
-        } else {
-            doc.cursor = Pos::new(line, 0);
-            doc.anchor = doc.cursor;
-            doc.insert(&format!("{indent}\n"));
+        edit(doc);
+        let at = if below { Pos::new(line, doc.lines[line].len()) } else { Pos::new(line, 0) };
+        let text = if below { format!("\n{indent}") } else { format!("{indent}\n") };
+        tracked(doc, Some(at), at, false, |doc| {
+            doc.cursor = at;
+            doc.anchor = at;
+            doc.insert(&text);
+        });
+        if !below {
             doc.cursor = Pos::new(line, indent.len());
             doc.anchor = doc.cursor;
         }
@@ -862,9 +1049,11 @@ impl Helix {
         } else {
             (if after { end } else { lo }, text.repeat(n), false)
         };
-        doc.cursor = at;
-        doc.anchor = at;
-        doc.insert(&body);
+        tracked(doc, Some(at), at, false, |doc| {
+            doc.cursor = at;
+            doc.anchor = at;
+            doc.insert(&body);
+        });
         let start = if skip { next(&doc.lines, at).unwrap_or(at) } else { at };
         let end = doc.cursor;
         select_gaps(doc, start, end);
@@ -883,30 +1072,23 @@ impl Helix {
         }
     }
 
+    /// Indents or outdents every line that any selection touches, once.
     fn indent(&mut self, doc: &mut Document, n: usize, deeper: bool) {
-        let (lo, hi) = sel(doc);
+        let mut lines: Vec<usize> = std::iter::once((doc.anchor, doc.cursor)).chain(doc.others.iter().map(|o| (o.anchor, o.cursor))).flat_map(|(a, c)| a.line.min(c.line)..=a.line.max(c.line)).collect();
+        lines.sort_unstable();
+        lines.dedup();
         edit(doc);
-        for line in lo.line..=hi.line {
-            let text = &mut doc.lines[line];
-            let change = if deeper {
-                if text.is_empty() {
-                    0
-                } else {
-                    text.insert_str(0, &" ".repeat(INDENT * n));
-                    (INDENT * n) as isize
+        for line in lines {
+            let start = Pos::new(line, 0);
+            if deeper {
+                if !doc.lines[line].is_empty() {
+                    tracked(doc, Some(start), start, true, |doc| doc.lines[line].insert_str(0, &" ".repeat(INDENT * n)));
                 }
             } else {
-                let take = first_non_blank(text).min(INDENT * n);
-                text.replace_range(..take, "");
-                -(take as isize)
-            };
-            for p in [&mut doc.cursor, &mut doc.anchor] {
-                if p.line == line {
-                    p.col = (p.col as isize + change).max(0) as usize;
-                }
+                let take = first_non_blank(&doc.lines[line]).min(INDENT * n);
+                tracked(doc, Some(start), Pos::new(line, take), true, |doc| doc.lines[line].replace_range(..take, ""));
             }
         }
-        settle(doc);
     }
 
     /// Joins the selected lines, or the cursor's line with the next.
@@ -921,25 +1103,129 @@ impl Helix {
             if lo.line + 1 >= doc.lines.len() {
                 break;
             }
-            let below = doc.lines.remove(lo.line + 1);
-            let line = &mut doc.lines[lo.line];
-            line.truncate(line.trim_end().len());
-            let below = below.trim_start();
-            if !line.is_empty() && !below.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(below);
+            let from = Pos::new(lo.line, doc.lines[lo.line].trim_end().len());
+            let to = Pos::new(lo.line + 1, first_non_blank(&doc.lines[lo.line + 1]));
+            tracked(doc, Some(from), to, true, |doc| {
+                let below = doc.lines.remove(lo.line + 1);
+                let line = &mut doc.lines[lo.line];
+                line.truncate(from.col);
+                let below = &below[to.col..];
+                if !line.is_empty() && !below.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(below);
+            });
         }
-        settle(doc);
+    }
+
+    // --- Several selections -------------------------------------------------
+
+    /// `C`: gives each selection a copy on the next line long enough to
+    /// hold it, `n` times over. The main selection moves to its last copy.
+    fn copy_to_lines(&mut self, doc: &mut Document, n: usize, down: bool) {
+        let all: Vec<Sel> = std::iter::once(Sel { anchor: doc.anchor, cursor: doc.cursor, goal: self.goal }).chain(doc.others.iter().copied()).collect();
+        let mut main_copy = None;
+        for (i, s) in all.iter().enumerate() {
+            if s.anchor.line != s.cursor.line {
+                continue;
+            }
+            let text = &doc.lines[s.cursor.line];
+            let (anchor, cursor) = (char_col(text, s.anchor.col), char_col(text, s.cursor.col));
+            let reach = anchor.max(cursor);
+            let mut line = s.cursor.line;
+            let mut made = 0;
+            while made < n {
+                if (down && line + 1 >= doc.lines.len()) || (!down && line == 0) {
+                    break;
+                }
+                line = if down { line + 1 } else { line - 1 };
+                let text = &doc.lines[line];
+                if text.chars().count() > reach || reach == 0 {
+                    let copy = Sel { anchor: Pos::new(line, byte_at(text, anchor)), cursor: Pos::new(line, byte_at(text, cursor)), goal: None };
+                    doc.others.push(copy);
+                    if i == 0 {
+                        main_copy = Some(doc.others.len() - 1);
+                    }
+                    made += 1;
+                }
+            }
+        }
+        if let Some(k) = main_copy {
+            self.swap(doc, k);
+        }
+    }
+
+    /// `s` and `S`: within the selections, selects every match of a
+    /// pattern, or with `split` the text between the matches.
+    fn select_matches(&mut self, doc: &mut Document, pattern: &str, split: bool) {
+        let re = match compile(pattern, true, true) {
+            Ok(re) => re,
+            Err(e) => return self.say(e),
+        };
+        let mut spans: Vec<(Pos, Pos)> = std::iter::once((doc.anchor, doc.cursor)).chain(doc.others.iter().map(|o| (o.anchor, o.cursor))).map(|(a, c)| (a.min(c), a.max(c))).collect();
+        spans.sort();
+        let mut found: Vec<(Pos, Pos)> = vec![];
+        for (lo, hi) in spans {
+            let text = text_between(&doc.lines, lo, next(&doc.lines, hi).unwrap_or(hi));
+            // Where a byte of `text` is in the document.
+            let at = |byte: usize| {
+                let before = &text[..byte];
+                match before.rfind('\n') {
+                    Some(i) => Pos::new(lo.line + before.matches('\n').count(), byte - i - 1),
+                    None => Pos::new(lo.line, lo.col + byte),
+                }
+            };
+            let mut from = 0;
+            for m in re.find_iter(&text).filter(|m| !m.is_empty()) {
+                if !split {
+                    found.push((at(m.start()), at(m.end())));
+                } else if m.start() > from {
+                    found.push((at(from), at(m.start())));
+                }
+                from = m.end();
+            }
+            if split && from < text.len() {
+                found.push((at(from), at(text.len())));
+            }
+        }
+        let Some(((start, end), rest)) = found.split_first() else {
+            return self.say(if split { "Nothing left after splitting" } else { "No matches in the selection" });
+        };
+        select_gaps(doc, *start, *end);
+        doc.others = rest.iter().map(|(a, b)| Sel { anchor: *a, cursor: prev(&doc.lines, *b).unwrap_or(*a), goal: None }).collect();
+        self.mode = Mode::Normal;
+        self.goal = None;
+    }
+
+    /// `Alt-,`: drops the main selection; the next one takes over.
+    fn drop_main(&mut self, doc: &mut Document) {
+        if doc.others.is_empty() {
+            return;
+        }
+        let here = doc.anchor.min(doc.cursor);
+        let k = doc.others.iter().position(|o| o.anchor.min(o.cursor) > here).unwrap_or(0);
+        let next = doc.others.remove(k);
+        doc.anchor = next.anchor;
+        doc.cursor = next.cursor;
+        self.goal = next.goal;
+    }
+
+    /// `)` and `(`: makes the selection `by` places along the main one.
+    fn rotate(&mut self, doc: &mut Document, by: isize) {
+        if doc.others.is_empty() {
+            return;
+        }
+        let ranks = order(doc);
+        let count = ranks.len() as isize;
+        let target = (ranks[0] as isize + by).rem_euclid(count) as usize;
+        if let Some(k) = ranks[1..].iter().position(|r| *r == target) {
+            self.swap(doc, k);
+        }
     }
 
     // --- Insert mode -------------------------------------------------------
 
     fn insert_key(&mut self, doc: &mut Document, key: HKey) {
-        let plain = |doc: &mut Document, a: Action| {
-            begin_insert(doc);
-            doc.apply_plain(a);
-        };
         let go = |doc: &mut Document, motion: Motion| {
             doc.apply_plain(Action::Move { motion, select: false });
         };
@@ -992,6 +1278,11 @@ impl Helix {
                 self.cmdline = Some((prefix, text));
             }
             HKey::Enter if prefix == ':' => self.command(doc, text.trim()),
+            HKey::Enter if prefix == 's' || prefix == 'S' => {
+                if !text.is_empty() {
+                    self.select_matches(doc, &text, prefix == 'S');
+                }
+            }
             HKey::Enter => {
                 if !text.is_empty() {
                     self.search = Some(text);
@@ -1043,6 +1334,10 @@ impl Helix {
                 (false, _) => matches.last(),
             };
             if let Some(m) = found {
+                // In Select mode the match joins the selections.
+                if self.mode == Mode::Select {
+                    doc.others.push(Sel { anchor: doc.anchor, cursor: doc.cursor, goal: None });
+                }
                 doc.anchor = Pos::new(line, m.start());
                 doc.cursor = Pos::new(line, prev_boundary(&doc.lines[line], m.end()));
                 if i == count || (i > 0 && forward != (line > lo.line)) {
@@ -1099,53 +1394,124 @@ fn from_gaps(doc: &mut Document) {
     }
 }
 
-/// Keeps both ends of the selection on real positions after an edit.
+/// Keeps every selection on real positions after an edit.
 fn settle(doc: &mut Document) {
     doc.cursor = doc.clamp(doc.cursor);
     doc.anchor = doc.clamp(doc.anchor);
+    for k in 0..doc.others.len() {
+        let o = doc.others[k];
+        doc.others[k] = Sel { anchor: doc.clamp(o.anchor), cursor: doc.clamp(o.cursor), ..o };
+    }
 }
 
-/// Starts an undo step for one command.
+/// Where each selection comes in document order: the main one first, then
+/// the others as stored.
+fn order(doc: &Document) -> Vec<usize> {
+    let starts: Vec<Pos> = std::iter::once(doc.anchor.min(doc.cursor)).chain(doc.others.iter().map(|o| o.anchor.min(o.cursor))).collect();
+    starts.iter().map(|s| starts.iter().filter(|t| *t < s).count()).collect()
+}
+
+/// Runs an edit that replaces the text between the gaps `from` and `to`,
+/// then moves the other selections so each stays on the text it was on.
+/// With `own`, this selection's ends move the same way. `from` may be left
+/// out when the edit ends at the cursor and only it knows where it began,
+/// as with Backspace.
+fn tracked(doc: &mut Document, from: Option<Pos>, to: Pos, own: bool, f: impl FnOnce(&mut Document)) {
+    let lines = doc.lines.len();
+    let tail = doc.lines[to.line].len() - to.col;
+    f(doc);
+    // The text after the edit is untouched, which locates where it now ends.
+    let line = (to.line + doc.lines.len()).saturating_sub(lines).min(doc.lines.len() - 1);
+    let end = Pos::new(line, doc.lines[line].len().saturating_sub(tail));
+    let from = from.unwrap_or(doc.cursor.min(to));
+    let map = |p: Pos| {
+        if p >= to {
+            if p.line == to.line { Pos::new(end.line, end.col + (p.col - to.col)) } else { Pos::new(end.line + (p.line - to.line), p.col) }
+        } else if p > from {
+            end
+        } else {
+            p
+        }
+    };
+    for o in &mut doc.others {
+        o.anchor = map(o.anchor);
+        o.cursor = map(o.cursor);
+    }
+    if own {
+        doc.anchor = map(doc.anchor);
+        doc.cursor = map(doc.cursor);
+    }
+}
+
+/// Starts the undo step for a command, or joins the one already open: a
+/// command over several selections, or a stay in Insert mode, undoes as one.
 fn edit(doc: &mut Document) {
-    doc.grouped = false;
-    doc.begin(EditKind::Other);
-}
-
-/// Starts the undo step that a whole stay in Insert mode shares.
-fn begin_insert(doc: &mut Document) {
     if !doc.grouped {
         doc.begin(EditKind::Other);
         doc.grouped = true;
     }
 }
 
+/// Applies a plain editing action at this selection.
+fn plain(doc: &mut Document, action: Action) {
+    edit(doc);
+    let (lo, hi) = (doc.cursor.min(doc.anchor), doc.cursor.max(doc.anchor));
+    let point = lo == hi;
+    let to = if point && action == Action::Delete { next(&doc.lines, hi).unwrap_or(hi) } else { hi };
+    let from = if point && action == Action::Backspace { None } else { Some(lo) };
+    tracked(doc, from, to, false, |doc| {
+        doc.apply_plain(action);
+    });
+}
+
 /// Deletes the selection, leaving the cursor where it started.
 fn remove(doc: &mut Document) {
-    to_gaps(doc);
-    doc.delete_selection();
-    doc.anchor = doc.cursor;
+    let (lo, end) = span(doc);
+    tracked(doc, Some(lo), end, false, |doc| {
+        doc.anchor = lo;
+        doc.cursor = end;
+        doc.delete_selection();
+        doc.anchor = doc.cursor;
+    });
 }
 
 /// Replaces the selection and returns the gaps around the new text.
 fn replace(doc: &mut Document, text: &str) -> (Pos, Pos) {
-    remove(doc);
-    let start = doc.cursor;
-    doc.insert(text);
-    (start, doc.cursor)
+    let (lo, end) = span(doc);
+    tracked(doc, Some(lo), end, false, |doc| {
+        doc.anchor = lo;
+        doc.cursor = end;
+        doc.insert(text);
+    });
+    (lo, doc.cursor)
 }
 
 fn remove_char(doc: &mut Document, p: Pos) {
-    let line = &mut doc.lines[p.line];
-    if p.col < line.len() {
-        line.remove(p.col);
+    let after = next(&doc.lines, p).unwrap_or(p);
+    if p.col < doc.lines[p.line].len() {
+        tracked(doc, Some(p), after, true, |doc| {
+            doc.lines[p.line].remove(p.col);
+        });
     }
 }
 
 fn set_char(doc: &mut Document, p: Pos, c: char) {
-    let line = &mut doc.lines[p.line];
-    if let Some(old) = line[p.col..].chars().next() {
-        line.replace_range(p.col..p.col + old.len_utf8(), &c.to_string());
+    let after = next(&doc.lines, p).unwrap_or(p);
+    if p.col < doc.lines[p.line].len() {
+        tracked(doc, Some(p), after, true, |doc| doc.lines[p.line].replace_range(p.col..after.col, &c.to_string()));
     }
+}
+
+/// `_`: shrinks the selection to leave out blank space at its ends.
+fn trim(doc: &mut Document) {
+    let (mut lo, mut hi) = sel(doc);
+    while lo < hi && ch(&doc.lines, lo).is_whitespace() {
+        lo = next(&doc.lines, lo).unwrap_or(hi);
+    }
+    while hi > lo && ch(&doc.lines, hi).is_whitespace() {
+        hi = prev(&doc.lines, hi).unwrap_or(lo);
+    }
+    (doc.anchor, doc.cursor) = if doc.cursor >= doc.anchor { (lo, hi) } else { (hi, lo) };
 }
 
 #[cfg(test)]
@@ -1607,13 +1973,199 @@ mod tests {
         assert_eq!(d.text(), " (b) c", "the count and register did not carry over");
     }
 
+    /// Every selection's text, in document order.
+    fn all(d: &Document) -> Vec<String> {
+        let mut spans: Vec<(Pos, Pos)> = std::iter::once((d.anchor, d.cursor)).chain(d.others.iter().map(|o| (o.anchor, o.cursor))).map(|(a, c)| (a.min(c), a.max(c))).collect();
+        spans.sort();
+        spans.into_iter().map(|(lo, hi)| text_between(&d.lines, lo, next(&d.lines, hi).unwrap_or(hi))).collect()
+    }
+
+    fn count(d: &Document) -> usize {
+        d.mode_status().unwrap().selections
+    }
+
     #[test]
-    fn multiple_selection_keys_say_they_are_unavailable() {
-        for key in ["C", "s", "S", ","] {
-            let d = after("a\nb", key);
-            assert_eq!(message(&d), NO_MULTI, "{key}");
-            assert_eq!(d.text(), "a\nb");
-        }
+    fn copying_a_cursor_down_types_on_every_line() {
+        let mut d = doc("abc\nabc\nabc");
+        press(&mut d, "CC");
+        assert_eq!(count(&d), 3);
+        assert_eq!(d.cursor(), Pos::new(2, 0), "the main selection is the newest copy");
+        press(&mut d, "iX<esc>");
+        assert_eq!(d.text(), "Xabc\nXabc\nXabc");
+        assert_eq!(count(&d), 3, "the cursors survive leaving Insert mode");
+        press(&mut d, "u");
+        assert_eq!(d.text(), "abc\nabc\nabc", "typing at every cursor is one undo step");
+        assert_eq!(count(&d), 3, "and undo brings the selections back with the text");
+        assert_eq!(count(&after("a\nb\nc\nd", "2C")), 3);
+        assert_eq!(count(&after("a\nb", "jC")), 1, "nowhere below the last line");
+        assert_eq!(count(&after("a\nb\nc", "j<A-C>")), 2);
+    }
+
+    #[test]
+    fn copying_skips_lines_too_short_to_hold_the_selection() {
+        let d = after("abcd\nab\nabcd", "3lC");
+        assert_eq!(count(&d), 2);
+        assert_eq!(d.cursor(), Pos::new(2, 3));
+        assert_eq!(all(&d), ["d", "d"]);
+    }
+
+    #[test]
+    fn selecting_matches_inside_the_selection() {
+        let mut d = doc("foo bar foo baz");
+        press(&mut d, "%s");
+        assert_eq!(d.mode_status().unwrap().command_line.as_deref(), Some("select:"));
+        press(&mut d, "foo<ret>");
+        assert_eq!(all(&d), ["foo", "foo"]);
+        assert_eq!(d.extra_selections(), [ExtraSelection { cursor: Pos::new(0, 10), range: Some((Pos::new(0, 8), Pos::new(0, 11))) }]);
+        press(&mut d, "cquux<esc>");
+        assert_eq!(d.text(), "quux bar quux baz", "the second change lands in the right place after the first grew the line");
+        let d = after("foo", "%sxyz<ret>");
+        assert_eq!((count(&d), message(&d).as_str()), (1, "No matches in the selection"));
+        assert_eq!(sel_text(&d), "foo", "and the selection is left alone");
+    }
+
+    #[test]
+    fn splitting_the_selection() {
+        let mut d = doc("a, b, c");
+        press(&mut d, "%S, <ret>");
+        assert_eq!(all(&d), ["a", "b", "c"]);
+        press(&mut d, "~");
+        assert_eq!(d.text(), "A, B, C");
+        let mut d = doc("one\ntwo\nthree");
+        press(&mut d, "%<A-s>");
+        assert_eq!(all(&d), ["one", "two", "three"], "one selection per line, without the line breaks");
+        press(&mut d, "A;<esc>");
+        assert_eq!(d.text(), "one;\ntwo;\nthree;");
+    }
+
+    #[test]
+    fn each_selection_moves_and_changes_on_its_own() {
+        let mut d = doc("ab cd\nef gh");
+        press(&mut d, "Cw");
+        assert_eq!(all(&d), ["ab ", "ef "]);
+        press(&mut d, "w");
+        assert_eq!(all(&d), ["cd", "gh"]);
+        press(&mut d, "gh");
+        assert_eq!(all(&d), ["a", "e"]);
+        press(&mut d, "vgl");
+        assert_eq!(all(&d), ["ab cd", "ef gh"], "Select mode extends every one");
+        press(&mut d, "<esc>_;");
+        assert_eq!(all(&d), ["d", "h"]);
+        press(&mut d, "rX");
+        assert_eq!(d.text(), "ab cX\nef gX");
+    }
+
+    #[test]
+    fn edits_on_one_line_keep_the_other_selections_in_step() {
+        assert_eq!(after("a b c", "%s\\w<ret>cxx<esc>").text(), "xx xx xx");
+        assert_eq!(after("x1 x2 x3", "%sx<ret>d").text(), "1 2 3");
+        assert_eq!(after("ab cd", "%s\\w+<ret>ms(").text(), "(ab) (cd)");
+        assert_eq!(after("(ab) (cd)", "%s\\w+<ret>md(").text(), "ab cd");
+        assert_eq!(after("ab cd", "%s\\w+<ret>>").text(), "    ab cd", "a line is indented once however many selections are on it");
+        assert_eq!(all(&after("ab cd", "%s\\w+<ret>>")), ["ab", "cd"], "and they stay on their words");
+    }
+
+    #[test]
+    fn edits_that_add_or_remove_lines_keep_selections_in_step() {
+        assert_eq!(after("a\nb", "CoX<esc>").text(), "a\nX\nb\nX");
+        assert_eq!(after("a\nb", "COX<esc>").text(), "X\na\nX\nb");
+        assert_eq!(after("a\nb\nc", "CCxd").text(), "");
+        assert_eq!(after("a\nb\nc", "%<A-s>d").text(), "\n\n");
+        assert_eq!(after("a\n  b\nc\n  d", "%s[ac]<ret>J").text(), "a b\nc d");
+        // Typing, new lines and backspace in Insert mode.
+        assert_eq!(after("ab\ncd", "CaX<ret>Y<bs>Z<esc>").text(), "aX\nZb\ncX\nZd");
+        // Two cursors on one line.
+        assert_eq!(after("ab", "%s.<ret>i-<esc>").text(), "-a-b");
+        assert_eq!(after("ab", "%s.<ret>a-<esc>").text(), "a-b-");
+    }
+
+    #[test]
+    fn yank_and_paste_pair_up_with_the_selections() {
+        let mut d = doc("a b");
+        press(&mut d, "%s\\w<ret>yp");
+        assert_eq!(d.text(), "aa bb", "each pastes its own");
+        assert_eq!(message(&after("a b", "%s\\w<ret>y")), "Yanked 2 selections");
+        // One selection pasting what several yanked takes the first piece.
+        let mut d = doc("a b");
+        press(&mut d, "%s\\w<ret>y,P");
+        assert_eq!(d.text(), "aa b");
+        // More selections than pieces: the rest take the last.
+        let mut d = doc("x y z");
+        press(&mut d, "y%s\\w<ret>R");
+        assert_eq!(d.text(), "x x x");
+        let mut d = doc("ab cd");
+        press(&mut d, "%s\\w+<ret><space>y");
+        assert_eq!(d.vim_view().unwrap().clipboard.map(|(_, t)| t).as_deref(), Some("ab\ncd"));
+    }
+
+    #[test]
+    fn selections_that_come_to_overlap_merge() {
+        let mut d = doc("abc def");
+        press(&mut d, "%s[ad]<ret>");
+        assert_eq!(all(&d), ["a", "d"]);
+        press(&mut d, "v3l");
+        assert_eq!(all(&d), ["abc ", "def"], "side by side is not overlapping");
+        press(&mut d, "l");
+        assert_eq!(count(&d), 1, "the first now reaches into the second, so they are one");
+        assert_eq!(sel_text(&d), "abc def");
+        // Cursors that land on the same spot become one.
+        let d = after("ab\ncd", "Cgg");
+        assert_eq!(count(&d), 1);
+    }
+
+    #[test]
+    fn choosing_among_selections() {
+        let mut d = doc("a b c");
+        press(&mut d, "%s\\w<ret>");
+        assert_eq!(sel_text(&d), "a", "the first match is the main selection");
+        press(&mut d, ")");
+        assert_eq!(sel_text(&d), "b");
+        press(&mut d, "((");
+        assert_eq!(sel_text(&d), "c", "and it goes round");
+        press(&mut d, "<A-,>");
+        assert_eq!((all(&d), sel_text(&d)), (vec!["a".to_owned(), "b".to_owned()], "a".to_owned()));
+        press(&mut d, "),");
+        assert_eq!((count(&d), sel_text(&d).as_str()), (1, "b"));
+        assert!(d.extra_selections().is_empty());
+    }
+
+    #[test]
+    fn search_in_select_mode_adds_a_selection() {
+        let mut d = doc("foo x foo");
+        press(&mut d, "/foo<ret>");
+        assert_eq!((count(&d), d.anchor()), (1, Pos::new(0, 6)), "in Normal mode the selection moves to the match");
+        press(&mut d, "vn");
+        assert_eq!(all(&d), ["foo", "foo"]);
+        press(&mut d, "<esc>%");
+        assert_eq!(count(&d), 1, "selecting everything is one selection again");
+    }
+
+    #[test]
+    fn trimming_blank_space_from_a_selection() {
+        let mut d = doc("hello world");
+        press(&mut d, "w_");
+        assert_eq!(sel_text(&d), "hello");
+        press(&mut d, "b_");
+        assert!(d.cursor() <= d.anchor(), "direction is kept");
+    }
+
+    #[test]
+    fn the_pointer_and_shortcuts_with_several_selections() {
+        let mut d = doc("ab\ncd");
+        press(&mut d, "C");
+        // A paste shortcut replaces every selection.
+        d.apply(Action::Insert("X".into()));
+        assert_eq!(d.text(), "Xb\nXd");
+        d.apply(Action::Undo);
+        assert_eq!((d.text().as_str(), count(&d)), ("ab\ncd", 2));
+        d.apply(Action::Indent);
+        assert_eq!(d.text(), "    ab\n    cd");
+        d.apply(Action::Click { pos: Pos::new(0, 1), select: false });
+        assert_eq!(count(&d), 1, "a click goes back to one selection");
+        // Leaving Helix drops the extra selections.
+        press(&mut d, "C");
+        d.set_keymap(Keymap::Plain);
+        assert!(d.extra_selections().is_empty());
     }
 
     #[test]

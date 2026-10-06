@@ -70,6 +70,26 @@ pub struct ModeStatus {
     pub message: Option<String>,
     /// The register a macro is being recorded into.
     pub recording: Option<char>,
+    /// How many selections there are. More than one only with Helix keys.
+    pub selections: usize,
+}
+
+/// A selection besides the main one, for an editor to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtraSelection {
+    /// Where its caret goes.
+    pub cursor: Pos,
+    /// The range to highlight, start first, if it covers any text.
+    pub range: Option<(Pos, Pos)>,
+}
+
+/// One of a document's additional selections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sel {
+    anchor: Pos,
+    cursor: Pos,
+    /// The column vertical movement aims for.
+    goal: Option<usize>,
 }
 
 /// An edit or cursor change. Editors send these to the application, which
@@ -114,6 +134,7 @@ struct Snapshot {
     lines: Vec<String>,
     cursor: Pos,
     anchor: Pos,
+    others: Vec<Sel>,
 }
 
 /// Editable text with a cursor, selection and undo history.
@@ -122,6 +143,8 @@ pub struct Document {
     lines: Vec<String>,
     cursor: Pos,
     anchor: Pos,
+    /// Selections besides the main one above. Only Helix keys make any.
+    others: Vec<Sel>,
     goal: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -172,7 +195,7 @@ impl Default for Document {
 impl Document {
     pub fn new(text: &str) -> Self {
         let lines: Vec<String> = normalize(text).split('\n').map(str::to_owned).collect();
-        Self { lines, cursor: Pos::default(), anchor: Pos::default(), goal: None, undo: vec![], redo: vec![], last_edit: EditKind::None, revision: 0, grouped: false, vim: None, helix: None }
+        Self { lines, cursor: Pos::default(), anchor: Pos::default(), others: vec![], goal: None, undo: vec![], redo: vec![], last_edit: EditKind::None, revision: 0, grouped: false, vim: None, helix: None }
     }
 
     /// Turns Vim-style modal editing on or off. It starts in Normal mode.
@@ -191,6 +214,7 @@ impl Document {
         self.grouped = false;
         self.vim = None;
         self.helix = None;
+        self.others.clear();
         self.anchor = self.cursor;
         match keymap {
             Keymap::Plain => {}
@@ -220,9 +244,9 @@ impl Document {
     /// with a modal keymap.
     pub fn mode_status(&self) -> Option<ModeStatus> {
         if let Some(h) = &self.helix {
-            return Some(h.status());
+            return Some(h.status(self));
         }
-        self.vim().map(|v| ModeStatus { label: v.mode.label(), insert: v.mode == Mode::Insert, pending: v.pending, command_line: v.command_line, message: v.message, recording: v.recording })
+        self.vim().map(|v| ModeStatus { label: v.mode.label(), insert: v.mode == Mode::Insert, pending: v.pending, command_line: v.command_line, message: v.message, recording: v.recording, selections: 1 })
     }
 
     /// Vim mode, pending keys, command line and messages, when Vim is on.
@@ -249,6 +273,13 @@ impl Document {
             Some(v) => v.display_selection(self),
             None => self.selection().map(|(a, b)| (a, b, false)),
         }
+    }
+
+    /// The selections besides the main one, which [`display_selection`](Self::display_selection)
+    /// and [`cursor`](Self::cursor) describe. Empty unless Helix keys have
+    /// made several.
+    pub fn extra_selections(&self) -> Vec<ExtraSelection> {
+        self.helix.as_ref().map(|h| h.extras(self)).unwrap_or_default()
     }
 
     /// What an editor widget needs from a modal keymap: block selections,
@@ -547,7 +578,7 @@ impl Document {
         }
         let coalesce = kind == EditKind::Typing && self.last_edit == EditKind::Typing && self.selection().is_none();
         if !coalesce {
-            self.undo.push(Snapshot { lines: self.lines.clone(), cursor: self.cursor, anchor: self.anchor });
+            self.undo.push(Snapshot { lines: self.lines.clone(), cursor: self.cursor, anchor: self.anchor, others: self.others.clone() });
             if self.undo.len() > 500 {
                 self.undo.remove(0);
             }
@@ -561,8 +592,9 @@ impl Document {
     fn step(&mut self, undo: bool) -> bool {
         let (from, to) = if undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
         let Some(snap) = from.pop() else { return false };
-        to.push(Snapshot { lines: std::mem::take(&mut self.lines), cursor: self.cursor, anchor: self.anchor });
+        to.push(Snapshot { lines: std::mem::take(&mut self.lines), cursor: self.cursor, anchor: self.anchor, others: std::mem::take(&mut self.others) });
         self.lines = snap.lines;
+        self.others = snap.others;
         self.cursor = snap.cursor;
         self.anchor = snap.anchor;
         self.last_edit = EditKind::None;
