@@ -45,6 +45,14 @@ pub trait App: 'static {
         view
     }
 
+    /// The menu bar: File, Edit and so on. On macOS these go in the system's
+    /// menu bar; elsewhere [`frame`](Self::frame) is asked to draw them.
+    /// Asked after every update, so entries can follow app state. A menu
+    /// entry's shortcut works whether or not its menu is open.
+    fn menus(&self) -> Vec<crate::Menu<Self::Message>> {
+        vec![]
+    }
+
     /// Key presses no widget handled, for app-wide shortcuts such as save.
     fn on_key(&self, _key: &KeyEvent) -> Option<Self::Message> {
         None
@@ -201,6 +209,9 @@ pub struct Chrome {
     pub rounded: bool,
     /// Paint the window background. False for a bare, see-through window.
     pub background: bool,
+    /// Draw the app's [`menus`](App::menus) at the top of the window. False
+    /// where the system shows them itself, as on macOS.
+    pub menu_bar: bool,
 }
 
 /// How a window looks. The framework reads the few things it needs itself;

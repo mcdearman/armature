@@ -43,6 +43,18 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
     ui.start(Arc::new(move || {
         let _ = waker.send_event(());
     }));
+    #[cfg(target_os = "macos")]
+    let menu_events = {
+        // The system's menu bar reports a chosen entry by its ID.
+        ui.set_native_menus(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waker = event_loop.create_proxy();
+        muda::MenuEvent::set_event_handler(Some(move |e: muda::MenuEvent| {
+            let _ = tx.send(e.id().0.clone());
+            let _ = waker.send_event(());
+        }));
+        rx
+    };
     if let Ok(mut clipboard) = arboard::Clipboard::new() {
         ui.set_clipboard_reader(Box::new(move || clipboard.get_text().ok()));
     }
@@ -63,6 +75,10 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         state: None,
         resizing: None,
         dropped: vec![],
+        #[cfg(target_os = "macos")]
+        menu: None,
+        #[cfg(target_os = "macos")]
+        menu_events,
     };
     event_loop.run_app(&mut shell).map_err(Error::EventLoop)?;
     match shell.error {
@@ -108,6 +124,11 @@ struct Shell<A: App> {
     resizing: Option<ManualResize>,
     /// Files let go over the window, gathered until the batch is complete.
     dropped: Vec<std::path::PathBuf>,
+    /// The system menu bar as last built, and what it was built from.
+    #[cfg(target_os = "macos")]
+    menu: Option<(u64, muda::Menu)>,
+    #[cfg(target_os = "macos")]
+    menu_events: std::sync::mpsc::Receiver<String>,
 }
 
 /// A resize in progress: the edge held, where the pointer grabbed it on the
@@ -265,6 +286,51 @@ impl<A: App> Shell<A> {
         if gpu.window.title() != title {
             gpu.window.set_title(&title);
         }
+    }
+
+    /// Puts the app's menus in the system's menu bar, rebuilding it only
+    /// when they have changed, and carries out entries chosen there.
+    #[cfg(target_os = "macos")]
+    fn sync_menus(&mut self) {
+        use muda::{MenuItem, PredefinedMenuItem, Submenu};
+        for id in self.menu_events.try_iter().collect::<Vec<_>>() {
+            let mut parts = id.strip_prefix("armature:").into_iter().flat_map(|r| r.split(':')).map(str::parse::<usize>);
+            if let (Some(Ok(menu)), Some(Ok(entry))) = (parts.next(), parts.next()) {
+                self.ui.choose_menu(menu, entry);
+            }
+        }
+        let menus = self.ui.menus();
+        let signature = crate::menu::signature(&menus);
+        if self.menu.as_ref().is_some_and(|(s, _)| *s == signature) {
+            return;
+        }
+        let bar = muda::Menu::new();
+        // The first menu is the app's own; macOS titles it with the app's name.
+        let app = Submenu::new("App", true);
+        let _ = app.append_items(&[
+            &PredefinedMenuItem::about(None, None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::hide(None),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(None),
+        ]);
+        let _ = bar.append(&app);
+        for (m, menu) in menus.iter().enumerate() {
+            let sub = Submenu::new(&menu.title, true);
+            for (e, entry) in menu.entries.iter().enumerate() {
+                let _ = if entry.separator {
+                    sub.append(&PredefinedMenuItem::separator())
+                } else {
+                    let keys = entry.shortcut.as_ref().and_then(|s| s.accelerator().parse().ok());
+                    sub.append(&MenuItem::with_id(format!("armature:{m}:{e}"), &entry.label, entry.message.is_some(), keys))
+                };
+            }
+            let _ = bar.append(&sub);
+        }
+        bar.init_for_nsapp();
+        self.menu = Some((signature, bar));
     }
 
     /// Applies the style's blur strength once the platform blur exists.
@@ -670,6 +736,11 @@ impl<A: App> ApplicationHandler for Shell<A> {
             let pos = self.gpu.as_ref().and_then(|g| crate::platform::pointer_position(&g.window)).or(self.pointer).unwrap_or(Point::ZERO);
             self.pointer = Some(pos);
             self.dispatch(Event::FilesDropped { pos, paths });
+        }
+        // Before the redraw check below, so a chosen entry shows at once.
+        #[cfg(target_os = "macos")]
+        if self.gpu.is_some() {
+            self.sync_menus();
         }
         let now = Instant::now();
         let mut wake = self.ui.tick(now);

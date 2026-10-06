@@ -22,6 +22,7 @@ pub mod controls;
 mod core;
 pub mod document;
 mod event;
+mod menu;
 mod platform;
 mod runtime;
 mod shell;
@@ -32,6 +33,7 @@ pub use anim::Anim;
 pub use app::{App, Chrome, Decorations, Proxy, Scheme, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
 pub use core::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, ResizeEdge, Widget, WidgetId, WindowRequest};
 pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
+pub use menu::{Menu, MenuEntry, Shortcut};
 pub use runtime::Ui;
 pub use shell::{run, Error};
 

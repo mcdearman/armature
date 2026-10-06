@@ -43,6 +43,8 @@ Three methods on `App` are the whole seam:
 - `fonts` returns the typefaces to draw text with. System fonts are always available as a fallback.
 - `frame` wraps the view in whatever the window needs drawn: its background and, with `Decorations::Custom`, a title bar.
 
+An app's `menus` (File, Edit and so on) are separate from all this. On macOS the framework puts them in the system's menu bar; elsewhere it asks `frame` to draw them at the top of the window. Shortcuts on menu entries work either way.
+
 A toolkit usually hides these behind its own app trait, as Neo does, so that apps never see them.
 
 ## Running the example and the tests

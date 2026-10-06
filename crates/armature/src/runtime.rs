@@ -21,6 +21,8 @@ pub struct Ui<A: App> {
     style: Style,
     decorations: Decorations,
     maximized: bool,
+    /// The system shows the app's menus, so the window need not.
+    native_menus: bool,
     needs_view: bool,
     needs_layout: bool,
     timers: Vec<(Duration, Instant)>,
@@ -41,6 +43,7 @@ impl<A: App> Ui<A> {
             style,
             decorations,
             maximized: false,
+            native_menus: false,
             needs_view: true,
             needs_layout: true,
             timers: vec![],
@@ -132,6 +135,27 @@ impl<A: App> Ui<A> {
         }
     }
 
+    /// Says that the system's menu bar shows the app's menus.
+    pub fn set_native_menus(&mut self, native: bool) {
+        if native != self.native_menus {
+            self.native_menus = native;
+            self.needs_view = true;
+        }
+    }
+
+    /// The app's menus as they are now.
+    pub fn menus(&self) -> Vec<crate::Menu<A::Message>> {
+        self.app.menus()
+    }
+
+    /// Chooses an entry of the app's menus, as the system's menu bar does.
+    pub fn choose_menu(&mut self, menu: usize, entry: usize) {
+        if let Some(m) = self.app.menus().get(menu).and_then(|m| m.entries.get(entry)).and_then(|e| e.message.clone()) {
+            self.app.update(m);
+            self.needs_view = true;
+        }
+    }
+
     pub fn set_window_focused(&mut self, f: bool) {
         self.rt.window_focused = f;
         self.rt.redraw = true;
@@ -183,7 +207,7 @@ impl<A: App> Ui<A> {
         if self.needs_view {
             let bare = self.app.window_state().bare;
             let title_bar = self.decorations == Decorations::Custom && !bare;
-            let chrome = Chrome { title: self.app.title(), title_bar, rounded: title_bar && !self.maximized, background: !bare };
+            let chrome = Chrome { title: self.app.title(), title_bar, rounded: title_bar && !self.maximized, background: !bare, menu_bar: !self.native_menus && !bare };
             let mut root = self.app.frame(self.app.view(), chrome);
             let mut pass = IdPass::default();
             root.assign_ids(WidgetId(1), 0, &mut pass);
@@ -272,7 +296,8 @@ impl<A: App> Ui<A> {
             && status == Status::Ignored
             && k.pressed
         {
-            if let Some(m) = self.app.on_key(k) {
+            // A menu entry's shortcut comes first, then the app's own keys.
+            if let Some(m) = crate::menu::shortcut_message(&self.app.menus(), k).or_else(|| self.app.on_key(k)) {
                 messages.push(m);
             } else if k.key == Key::Tab {
                 self.move_focus(!k.modifiers.shift);
