@@ -385,6 +385,11 @@ impl<'a, 'b> Cx<'a, 'b> {
         self.shared.runtime.cursor = c;
     }
 
+    /// The pointer asked for so far while this event is handed round.
+    pub fn cursor(&self) -> CursorIcon {
+        self.shared.runtime.cursor
+    }
+
     pub fn window_request(&mut self, r: WindowRequest) {
         self.shared.runtime.window_requests.push(r);
     }
@@ -599,6 +604,18 @@ impl<M> Element<M> {
     /// Sets this element's position relative to its parent's origin.
     pub fn set_position(&mut self, p: Point) {
         self.rel = p;
+    }
+
+    /// Where this element was put, relative to its parent's origin.
+    pub fn position(&self) -> Point {
+        self.rel
+    }
+
+    /// The elements inside this one, as laid out: for a container that
+    /// needs to know where one of its content's own children ended up,
+    /// such as a scrolling area bringing a row into view.
+    pub fn children_mut(&mut self) -> &mut [Element<M>] {
+        self.widget.children_mut()
     }
 
 

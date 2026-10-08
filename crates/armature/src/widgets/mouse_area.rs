@@ -19,6 +19,7 @@ struct AreaState {
 /// and dragging it away as files.
 pub struct MouseArea<M> {
     child: [Element<M>; 1],
+    on_press: Option<Box<dyn Fn() -> M>>,
     on_secondary: Option<Box<dyn Fn(Point) -> M>>,
     on_drop: Option<Box<dyn Fn(Vec<PathBuf>) -> M>>,
     drag_files: Vec<PathBuf>,
@@ -26,7 +27,15 @@ pub struct MouseArea<M> {
 
 impl<M: 'static> MouseArea<M> {
     pub fn new(child: impl Into<Element<M>>) -> Self {
-        Self { child: [child.into()], on_secondary: None, on_drop: None, drag_files: vec![] }
+        Self { child: [child.into()], on_press: None, on_secondary: None, on_drop: None, drag_files: vec![] }
+    }
+
+    /// Called when the area is clicked anywhere that nothing inside it
+    /// takes the click for itself: the plain part of a card with buttons
+    /// on it. The pointer shows that it can be clicked.
+    pub fn on_press(mut self, f: impl Fn() -> M + 'static) -> Self {
+        self.on_press = Some(Box::new(f));
+        self
     }
 
     /// Called with the pointer's position in the window when the secondary
@@ -112,6 +121,15 @@ impl<M: 'static> Widget<M> for MouseArea<M> {
                     cx.emit(f(*pos));
                     return Status::Captured;
                 }
+                if let (false, PointerButton::Primary, Some(f)) = (secondary, *button, &self.on_press) {
+                    cx.emit(f());
+                    return Status::Captured;
+                }
+                Status::Ignored
+            }
+            // Somewhere to click, unless what is inside says otherwise.
+            Event::PointerMoved { pos } if self.on_press.is_some() && bounds.contains(*pos) && cx.cursor() == crate::CursorIcon::Default => {
+                cx.set_cursor(crate::CursorIcon::Pointer);
                 Status::Ignored
             }
             Event::FilesDropped { pos, paths } if bounds.contains(*pos) => match &self.on_drop {
