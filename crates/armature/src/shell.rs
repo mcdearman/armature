@@ -34,6 +34,14 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Set when the app is asked to open again while running, for the event
+/// loop to pass on.
+#[cfg(target_os = "macos")]
+static REOPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Wakes the event loop to hear of it.
+#[cfg(target_os = "macos")]
+static REOPEN_WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
 /// Opens a window and runs `app` until it closes.
 pub fn run<A: App>(app: A) -> Result<(), Error> {
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
@@ -43,6 +51,13 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
     ui.start(Arc::new(move || {
         let _ = waker.send_event(());
     }));
+    #[cfg(target_os = "macos")]
+    {
+        let waker = event_loop.create_proxy();
+        let _ = REOPEN_WAKE.set(Box::new(move || {
+            let _ = waker.send_event(());
+        }));
+    }
     #[cfg(target_os = "macos")]
     let menu_events = {
         // The system's menu bar reports a chosen entry by its ID.
@@ -610,6 +625,14 @@ impl<A: App> ApplicationHandler for Shell<A> {
         if self.gpu.is_some() {
             return;
         }
+        // Launched: from here on, a click on the Dock icon is heard.
+        #[cfg(target_os = "macos")]
+        crate::platform::watch_reopen(Box::new(|| {
+            REOPENED.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(wake) = REOPEN_WAKE.get() {
+                wake();
+            }
+        }));
         if let Err(e) = self.create(event_loop) {
             self.error = Some(e);
             event_loop.exit();
@@ -784,6 +807,10 @@ impl<A: App> ApplicationHandler for Shell<A> {
         #[cfg(target_os = "macos")]
         if self.gpu.is_some() {
             self.sync_menus();
+        }
+        #[cfg(target_os = "macos")]
+        if REOPENED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.ui.reopened();
         }
         let now = Instant::now();
         let mut wake = self.ui.tick(now);

@@ -18,6 +18,14 @@ pub(crate) fn drag_files(window: &Window, paths: &[std::path::PathBuf]) -> bool 
     }
 }
 
+/// Has `tell` called each time the app is asked to open again while it
+/// is running, as by a click on its Dock icon. To be called once the app
+/// has launched.
+#[cfg(target_os = "macos")]
+pub(crate) fn watch_reopen(tell: Box<dyn Fn() + Send + Sync>) {
+    macos::watch_reopen(tell);
+}
+
 /// Where the pointer is in the window, in logical pixels, when the platform
 /// can say without a pointer event. Needed while another app's drag is over
 /// the window, because no pointer events arrive then.
@@ -232,6 +240,25 @@ mod macos {
     unsafe extern "C" {
         fn armature_drag_files(ns_view: *mut std::ffi::c_void, paths: *const *const std::ffi::c_char, count: std::ffi::c_int) -> std::ffi::c_int;
         fn armature_pointer_in_view(ns_view: *mut std::ffi::c_void, x: *mut f64, y: *mut f64) -> std::ffi::c_int;
+        fn armature_watch_reopen(callback: extern "C" fn());
+    }
+
+    /// What to do when the app is asked to open again while it is running.
+    static REOPENED: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+    extern "C" fn reopened() {
+        if let Some(tell) = REOPENED.get() {
+            tell();
+        }
+    }
+
+    /// Has `tell` called each time the app is asked to open again: its
+    /// Dock icon clicked while it runs. To be called once the app has
+    /// launched; only the first call's `tell` is kept.
+    pub(super) fn watch_reopen(tell: Box<dyn Fn() + Send + Sync>) {
+        let _ = REOPENED.set(tell);
+        // SAFETY: called on the main thread, with a function that lives as long as the program.
+        unsafe { armature_watch_reopen(reopened) };
     }
 
     pub(super) fn drag_files(window: &Window, paths: &[std::path::PathBuf]) -> bool {

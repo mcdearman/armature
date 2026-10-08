@@ -99,6 +99,14 @@ impl<A: App> Ui<A> {
         self.app.should_exit()
     }
 
+    /// The app was asked to open again while running. Tells it so.
+    pub fn reopened(&mut self) {
+        if let Some(m) = self.app.on_reopen() {
+            self.app.update(m);
+            self.needs_view = true;
+        }
+    }
+
     /// The app is ending. Tells it so, once.
     pub fn exiting(&mut self) {
         if !std::mem::replace(&mut self.exited, true) {

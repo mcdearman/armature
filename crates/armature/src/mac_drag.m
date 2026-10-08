@@ -59,3 +59,32 @@ int armature_pointer_in_view(void *ns_view, double *x, double *y) {
     *y = view.isFlipped ? p.y : view.bounds.size.height - p.y;
     return 1;
 }
+
+// Tells of the app being asked to open again while it is running: its
+// Dock icon clicked, or opened again from the Finder or a launcher. An app
+// whose window is out of sight hears nothing else of it.
+static void (*armature_reopen_callback)(void);
+
+@interface ArmatureReopen : NSObject
+@end
+
+@implementation ArmatureReopen
+- (void)handle:(NSAppleEventDescriptor *)event withReply:(NSAppleEventDescriptor *)reply {
+    if (armature_reopen_callback != NULL) {
+        armature_reopen_callback();
+    }
+}
+@end
+
+// Has `callback` called, on the main thread, each time the app is asked to
+// open again. To be called once the app has finished launching: AppKit
+// sets its own handler for this as it launches, which this takes over.
+void armature_watch_reopen(void (*callback)(void)) {
+    armature_reopen_callback = callback;
+    static ArmatureReopen *handler;
+    if (handler == nil) {
+        handler = [ArmatureReopen new];
+    }
+    // The Apple event 'aevt'/'rapp': reopen application.
+    [[NSAppleEventManager sharedAppleEventManager] setEventHandler:handler andSelector:@selector(handle:withReply:) forEventClass:'aevt' andEventID:'rapp'];
+}

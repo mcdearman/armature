@@ -105,6 +105,11 @@ impl<A: App> Harness<A> {
         self.event(Event::WindowFocus(focused));
     }
 
+    /// Asks the app to open again, as a click on its Dock icon does while it runs.
+    pub fn reopen(&mut self) {
+        self.ui.reopened();
+    }
+
     /// Ends the app, as quitting it does.
     pub fn exit(&mut self) {
         self.ui.exiting();
