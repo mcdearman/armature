@@ -602,6 +602,10 @@ fn map_key(k: &WKey) -> Key {
 }
 
 impl<A: App> ApplicationHandler for Shell<A> {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.ui.exiting();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
             return;

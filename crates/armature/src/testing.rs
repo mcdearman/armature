@@ -105,6 +105,11 @@ impl<A: App> Harness<A> {
         self.event(Event::WindowFocus(focused));
     }
 
+    /// Ends the app, as quitting it does.
+    pub fn exit(&mut self) {
+        self.ui.exiting();
+    }
+
     /// The modifier keys held during the pointer events that follow.
     pub fn set_modifiers(&mut self, m: Modifiers) {
         self.ui.set_modifiers(m);

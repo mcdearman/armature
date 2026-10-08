@@ -23,6 +23,8 @@ pub struct Ui<A: App> {
     maximized: bool,
     /// The system shows the app's menus, so the window need not.
     native_menus: bool,
+    /// The app has been told it is ending.
+    exited: bool,
     needs_view: bool,
     needs_layout: bool,
     timers: Vec<(Duration, Instant)>,
@@ -44,6 +46,7 @@ impl<A: App> Ui<A> {
             decorations,
             maximized: false,
             native_menus: false,
+            exited: false,
             needs_view: true,
             needs_layout: true,
             timers: vec![],
@@ -94,6 +97,13 @@ impl<A: App> Ui<A> {
 
     pub fn should_exit(&self) -> bool {
         self.app.should_exit()
+    }
+
+    /// The app is ending. Tells it so, once.
+    pub fn exiting(&mut self) {
+        if !std::mem::replace(&mut self.exited, true) {
+            self.app.on_exit();
+        }
     }
 
     /// The user asked to close the window. Returns true if the app should end.
@@ -390,5 +400,12 @@ impl<A: App> Ui<A> {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+}
+
+/// However the app's run comes to an end, it is told before it goes.
+impl<A: App> Drop for Ui<A> {
+    fn drop(&mut self) {
+        self.exiting();
     }
 }
