@@ -35,6 +35,6 @@ pub use core::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, 
 pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use menu::{with_app_entries, Menu, MenuEntry, Shortcut};
 pub use runtime::Ui;
-pub use shell::{run, Error};
+pub use shell::{on_menu_chosen, run, Error};
 
 pub use armature_render::{Color, Corners, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, TextLayout, TextStyle};

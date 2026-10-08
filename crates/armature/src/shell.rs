@@ -42,6 +42,24 @@ static REOPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 #[cfg(target_os = "macos")]
 static REOPEN_WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
 
+/// Hears of every entry chosen from a menu, by its ID.
+static OTHER_MENUS: std::sync::OnceLock<MenuHeard> = std::sync::OnceLock::new();
+type MenuHeard = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Has `heard` called, with the entry's ID, whenever an entry is chosen
+/// from any menu made with `muda` in this program: the app's own, and any
+/// other, such as a tray icon's.
+///
+/// `muda` lets one handler be set for the whole program, and on macOS
+/// this framework sets it, for the menu bar; so `MenuEvent::set_event_handler`
+/// called anywhere else is ignored there, without a word. A tray icon's
+/// menu is listened to through this instead. Only the first call counts.
+/// Where the framework sets no handler (everywhere but macOS, so far) it
+/// is never called, and `muda`'s own way works.
+pub fn on_menu_chosen(heard: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = OTHER_MENUS.set(Box::new(heard));
+}
+
 /// Opens a window and runs `app` until it closes.
 pub fn run<A: App>(app: A) -> Result<(), Error> {
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
@@ -65,6 +83,10 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         let (tx, rx) = std::sync::mpsc::channel();
         let waker = event_loop.create_proxy();
         muda::MenuEvent::set_event_handler(Some(move |e: muda::MenuEvent| {
+            // A menu that is not the app's own, such as a tray icon's, is the app's to answer.
+            if let Some(other) = OTHER_MENUS.get() {
+                other(&e.id().0);
+            }
             let _ = tx.send(e.id().0.clone());
             let _ = waker.send_event(());
         }));
