@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use armature_render::{Point, Size};
+use armature_render::{Point, Rect, Size};
 
 use crate::core::{Cx, DrawCx, Element, EventCx, Length, Limits, Widget, WindowRequest};
 use crate::event::{Event, PointerButton, Status};
@@ -20,6 +20,7 @@ struct AreaState {
 pub struct MouseArea<M> {
     child: [Element<M>; 1],
     on_press: Option<Box<dyn Fn() -> M>>,
+    on_press_in: Option<Box<dyn Fn(Rect) -> M>>,
     on_secondary: Option<Box<dyn Fn(Point) -> M>>,
     on_drop: Option<Box<dyn Fn(Vec<PathBuf>) -> M>>,
     drag_files: Vec<PathBuf>,
@@ -27,7 +28,7 @@ pub struct MouseArea<M> {
 
 impl<M: 'static> MouseArea<M> {
     pub fn new(child: impl Into<Element<M>>) -> Self {
-        Self { child: [child.into()], on_press: None, on_secondary: None, on_drop: None, drag_files: vec![] }
+        Self { child: [child.into()], on_press: None, on_press_in: None, on_secondary: None, on_drop: None, drag_files: vec![] }
     }
 
     /// Called when the area is clicked anywhere that nothing inside it
@@ -35,6 +36,14 @@ impl<M: 'static> MouseArea<M> {
     /// on it. The pointer shows that it can be clicked.
     pub fn on_press(mut self, f: impl Fn() -> M + 'static) -> Self {
         self.on_press = Some(Box::new(f));
+        self
+    }
+
+    /// As [`on_press`](Self::on_press), called with where the area is in
+    /// the window: for a control that opens something beside itself, such
+    /// as a menu under a button.
+    pub fn on_press_in(mut self, f: impl Fn(Rect) -> M + 'static) -> Self {
+        self.on_press_in = Some(Box::new(f));
         self
     }
 
@@ -125,10 +134,14 @@ impl<M: 'static> Widget<M> for MouseArea<M> {
                     cx.emit(f());
                     return Status::Captured;
                 }
+                if let (false, PointerButton::Primary, Some(f)) = (secondary, *button, &self.on_press_in) {
+                    cx.emit(f(bounds));
+                    return Status::Captured;
+                }
                 Status::Ignored
             }
             // Somewhere to click, unless what is inside says otherwise.
-            Event::PointerMoved { pos } if self.on_press.is_some() && bounds.contains(*pos) && cx.cursor() == crate::CursorIcon::Default => {
+            Event::PointerMoved { pos } if (self.on_press.is_some() || self.on_press_in.is_some()) && bounds.contains(*pos) && cx.cursor() == crate::CursorIcon::Default => {
                 cx.set_cursor(crate::CursorIcon::Pointer);
                 Status::Ignored
             }
