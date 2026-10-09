@@ -55,4 +55,10 @@ impl<M: 'static> From<Stack<M>> for Element<M> {
         Element::new(w)
     }
 }
+
+impl<M: 'static> From<Viewport<M>> for Element<M> {
+    fn from(w: Viewport<M>) -> Self {
+        Element::new(w)
+    }
+}
 pub use viewport::{viewport, Viewport, ViewportEvent};
