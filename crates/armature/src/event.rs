@@ -77,6 +77,12 @@ pub enum Event {
     Key(KeyEvent),
     /// Files dragged from another app, or from this one, and let go here.
     FilesDropped { pos: Point, paths: Vec<std::path::PathBuf> },
+    /// How far the pointer moved while it is held in the window: see
+    /// [`WindowRequest::CapturePointer`](crate::WindowRequest::CapturePointer).
+    /// In the device's own units, with no position.
+    PointerMotion { delta: Point },
+    /// The pointer was let go by the system, not by the widget that held it.
+    PointerCaptureLost,
     /// Text committed by an input method.
     Ime(String),
     /// The window gained or lost keyboard focus.

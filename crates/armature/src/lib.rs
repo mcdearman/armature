@@ -30,11 +30,14 @@ pub mod testing;
 pub mod widgets;
 
 pub use anim::Anim;
-pub use app::{App, Chrome, Decorations, Proxy, Scheme, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
+pub use app::{App, Chrome, Decorations, Graphics, Proxy, Scheme, Style, Subscription, WindowGeometry, WindowSettings, WindowState};
 pub use core::{Align, Cx, CursorIcon, DrawCx, Element, EventCx, Length, Limits, Padding, ResizeEdge, Widget, WidgetId, WindowRequest};
 pub use event::{Event, Key, KeyEvent, Modifiers, PointerButton, Status};
 pub use menu::{with_app_entries, Menu, MenuEntry, Shortcut};
 pub use runtime::Ui;
 pub use shell::{on_menu_chosen, run, Error};
 
+/// The graphics library everything here is drawn with, for an app that
+/// draws with the same device: see [`App::graphics`].
+pub use armature_render::wgpu;
 pub use armature_render::{Color, Corners, Cover, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, TextLayout, TextStyle};

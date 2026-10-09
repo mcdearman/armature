@@ -31,6 +31,8 @@ pub struct Ui<A: App> {
     inbox: Option<Receiver<A::Message>>,
     /// Where the last frame drew something: see [`Ui::hit`].
     drawn: Option<armature_render::Cover>,
+    /// When the app was last stepped: see [`Ui::step`].
+    stepped: Option<Instant>,
 }
 
 impl<A: App> Ui<A> {
@@ -54,6 +56,7 @@ impl<A: App> Ui<A> {
             timers: vec![],
             inbox: None,
             drawn: None,
+            stepped: None,
         }
     }
 
@@ -287,6 +290,31 @@ impl<A: App> Ui<A> {
         }
     }
 
+    /// Tells the app of the graphics device it is drawn with: see
+    /// [`App::graphics`]. For whoever runs this, once, before the first frame.
+    pub fn graphics(&mut self, graphics: &crate::app::Graphics) {
+        self.app.graphics(graphics);
+        self.needs_view = true;
+    }
+
+    /// How many physical pixels there are to a logical one, for widgets
+    /// that have to know: see `Cx::scale`.
+    pub fn set_scale(&mut self, scale: f32) {
+        if self.rt.scale != scale {
+            self.rt.scale = scale;
+            self.rt.redraw = true;
+        }
+    }
+
+    /// Lets the app move on before a frame is drawn: see [`App::step`].
+    /// For whoever runs this, once before each [`draw`](Self::draw).
+    pub fn step(&mut self, now: Instant) {
+        let dt = self.stepped.map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
+        self.stepped = Some(now);
+        // What it shows may be different now.
+        self.needs_view |= self.app.step(now, dt);
+    }
+
     /// Rebuilds and lays out the view if anything changed.
     pub fn refresh(&mut self, text: &mut TextSystem) {
         self.ensure(text);
@@ -305,6 +333,9 @@ impl<A: App> Ui<A> {
         let mut cx = DrawCx { cx: Cx { shared: &mut shared, id: WidgetId(0), bounds: root.bounds() }, scene: &mut scene };
         root.draw(&mut cx);
         self.drawn = Some(scene.cover());
+        // What drawing found out, a viewport's size say, is the app's before
+        // its next step and not a frame after it.
+        self.apply_deferred();
         scene
     }
 

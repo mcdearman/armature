@@ -9,7 +9,7 @@ A cross-platform GUI framework in Rust with no look of its own. Armature opens w
 | Crate | Role |
 |---|---|
 | `armature-render` | wgpu renderer. The caller supplies every colour, shadow and typeface. Each shape is one instanced SDF quad: rounded rectangles, borders, Gaussian drop and inner shadows, arcs, lines and area fills. Also backdrop blur, images with mipmaps, text, and PNG readback. |
-| `armature` | Windows, input, layout, the app loop, widget state, a headless test harness, the widgets that only arrange or capture (rows, columns, stacks, spacing, pictures, mouse areas, plain labels), and the text-editing model. |
+| `armature` | Windows, input, layout, the app loop, widget state, a headless test harness, the widgets that only arrange or capture (rows, columns, stacks, spacing, pictures, mouse areas, plain labels, and a viewport for a game or anything else that draws its own picture on the window's graphics device), and the text-editing model. |
 
 ## How an app is written
 

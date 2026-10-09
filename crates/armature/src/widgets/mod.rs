@@ -8,6 +8,7 @@ mod mouse_area;
 mod picture;
 mod space;
 mod stack;
+mod viewport;
 
 pub use flex::{column, row, Column, Flex, Justify, Row};
 pub use label::{label, Label};
@@ -54,3 +55,4 @@ impl<M: 'static> From<Stack<M>> for Element<M> {
         Element::new(w)
     }
 }
+pub use viewport::{viewport, Viewport, ViewportEvent};

@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::any::Any;
 use std::rc::Rc;
 
-use armature_render::{Color, Fonts, Point, Rect, Size, TextStyle};
+use armature_render::{wgpu, Color, Fonts, Point, Rect, Size, TextStyle};
 
 use crate::core::Element;
 use crate::event::KeyEvent;
@@ -58,6 +58,42 @@ pub trait App: 'static {
     /// no such menu, so there they follow the entries of the first menu.
     fn app_menu(&self) -> Vec<crate::MenuEntry<Self::Message>> {
         vec![]
+    }
+
+    /// The optional abilities of the graphics device this app would have
+    /// turned on, out of those the computer's adapter has. Asked once,
+    /// before the device is made; what is asked for and not there is left
+    /// out, so ask for what is wanted and look in [`Graphics::features`]
+    /// for what was given. The default asks for none.
+    fn wanted_features(&self, _available: wgpu::Features) -> wgpu::Features {
+        wgpu::Features::empty()
+    }
+
+    /// The limits the graphics device is to be made with, given the most
+    /// the adapter allows: an app with very large buffers, say, raises
+    /// `max_buffer_size` to the adapter's. The default is wgpu's own.
+    fn wanted_limits(&self, _available: &wgpu::Limits) -> wgpu::Limits {
+        wgpu::Limits::default()
+    }
+
+    /// The graphics device the window is drawn with, for an app that draws
+    /// with it too: a game rendering into a texture that is then shown as
+    /// an `Image::from_texture`. Called once, before the first view. The
+    /// device and queue are handles, to be cloned and kept.
+    fn graphics(&mut self, _graphics: &Graphics) {}
+
+    /// Called before each frame is drawn, after the input that came before
+    /// it, with the time and how long it has been since the last: where a
+    /// game moves on and draws its own frame, so that what the window then
+    /// shows is this frame's and not the one before. Frames are drawn only
+    /// when something asks for one; a `viewport` that is playing asks for
+    /// every one. `dt` is zero for the first.
+    ///
+    /// Returns whether what the app shows may have changed, so that its
+    /// view is asked for again: true from a game that has a new frame to
+    /// show. The default does nothing and says nothing changed.
+    fn step(&mut self, _now: std::time::Instant, _dt: Duration) -> bool {
+        false
     }
 
     /// Key presses no widget handled, for app-wide shortcuts such as save.
@@ -157,6 +193,24 @@ pub struct Subscription<M> {
 impl<M> Subscription<M> {
     pub fn every(period: Duration, message: M) -> Self {
         Self { period, message }
+    }
+}
+
+/// The graphics device a window is drawn with: see [`App::graphics`].
+#[derive(Clone, Debug)]
+pub struct Graphics {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    /// The optional abilities the device was made with: those the app
+    /// wanted that the adapter has.
+    pub features: wgpu::Features,
+    pub limits: wgpu::Limits,
+}
+
+impl Graphics {
+    /// What a device and its queue are, as they were made.
+    pub fn of(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        Self { device: device.clone(), queue: queue.clone(), features: device.features(), limits: device.limits() }
     }
 }
 

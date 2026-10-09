@@ -29,6 +29,8 @@ impl<A: App> Harness<A> {
         let reader = clipboard.clone();
         ui.set_clipboard_reader(Box::new(move || reader.borrow().clone()));
         ui.start(std::sync::Arc::new(|| {}));
+        ui.set_scale(1.0);
+        ui.graphics(&crate::Graphics::of(renderer.device(), renderer.queue()));
         Ok(Self { ui, renderer, size, clock: Instant::now(), clipboard })
     }
 
@@ -163,6 +165,25 @@ impl<A: App> Harness<A> {
             let key = if c == ' ' { Key::Space } else { Key::Character(c.to_string()) };
             self.event(Event::Key(KeyEvent { key, pressed: true, repeat: false, modifiers: Modifiers::default(), text: Some(c.to_string()) }));
         }
+    }
+
+    /// A frame as a window would draw it, `d` after the last: the app is
+    /// stepped (see [`App::step`]) and then drawn. Returns the frame's
+    /// straight-alpha RGBA pixels at `scale`.
+    pub fn frame(&mut self, d: Duration, scale: f32) -> Vec<u8> {
+        self.clock += d;
+        self.ui.set_scale(scale);
+        self.ui.tick(self.clock);
+        self.ui.step(self.clock);
+        let scene = self.ui.draw(self.renderer.text(), self.clock);
+        let (w, h) = ((self.size.w * scale) as u32, (self.size.h * scale) as u32);
+        self.renderer.render_to_rgba(&scene, w, h, scale)
+    }
+
+    /// Whether the last frame drawn asked for another straight after it,
+    /// as an animation or a game that is playing does.
+    pub fn wants_frame(&self) -> bool {
+        self.ui.needs_redraw()
     }
 
     /// Advances the clock, firing timers and finishing animations.

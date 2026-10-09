@@ -107,6 +107,7 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         close: false,
         blur_strength: None,
         blur_attempts: 0,
+        captured: false,
         hidden: false,
         retry_at: None,
         state: None,
@@ -149,6 +150,9 @@ struct Shell<A: App> {
     /// the platform's blur layers to appear.
     blur_strength: Option<f32>,
     blur_attempts: u32,
+    /// The pointer is held in the window and hidden: see
+    /// [`WindowRequest::CapturePointer`].
+    captured: bool,
     /// The window is fully covered, minimised or on a sleeping display, so
     /// nothing is drawn until it is visible again.
     hidden: bool,
@@ -225,7 +229,10 @@ impl<A: App> Shell<A> {
                 .request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })
                 .await
                 .map_err(|e| Error::Graphics(format!("no GPU adapter: {e}")))?;
-            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.map_err(|e| Error::Graphics(e.to_string()))?;
+            // With whatever the app wants of what this adapter has.
+            let app = self.ui.app();
+            let descriptor = wgpu::DeviceDescriptor { required_features: app.wanted_features(adapter.features()) & adapter.features(), required_limits: app.wanted_limits(&adapter.limits()), ..Default::default() };
+            let (device, queue) = adapter.request_device(&descriptor).await.map_err(|e| Error::Graphics(e.to_string()))?;
             Ok::<_, Error>((adapter, device, queue))
         })?;
 
@@ -255,6 +262,9 @@ impl<A: App> Shell<A> {
         surface.configure(&device, &config);
         let scale = window.scale_factor() as f32;
         self.ui.resize(Size::new(size.width as f32 / scale, size.height as f32 / scale));
+        self.ui.set_scale(scale);
+        // Before the first view: an app that draws with the device has it by then.
+        self.ui.graphics(&crate::app::Graphics::of(&device, &queue));
         self.gpu = Some(Gpu {
             renderer: Renderer::new(device, queue, self.ui.app().fonts()),
             surface,
@@ -466,7 +476,11 @@ impl<A: App> Shell<A> {
         };
         self.retry_at = None;
         let scale = gpu.window.scale_factor() as f32;
-        let scene = self.ui.draw(gpu.renderer.text(), Instant::now());
+        self.ui.set_scale(scale);
+        // The app's own frame first, so that what is shown is this one's.
+        let now = Instant::now();
+        self.ui.step(now);
+        let scene = self.ui.draw(gpu.renderer.text(), now);
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         gpu.window.pre_present_notify();
         gpu.renderer.render(&scene, &view, gpu.target, gpu.config.width, gpu.config.height, scale);
@@ -517,6 +531,16 @@ impl<A: App> Shell<A> {
                     if self.ui.close_requested() {
                         self.close = true;
                     }
+                }
+                WindowRequest::CapturePointer(hold) => {
+                    use winit::window::CursorGrabMode;
+                    // Held where it is, or failing that kept inside the window; either way out of sight.
+                    let held = hold && (gpu.window.set_cursor_grab(CursorGrabMode::Locked).is_ok() || gpu.window.set_cursor_grab(CursorGrabMode::Confined).is_ok());
+                    if !held {
+                        let _ = gpu.window.set_cursor_grab(CursorGrabMode::None);
+                    }
+                    gpu.window.set_cursor_visible(!held);
+                    self.captured = held;
                 }
             }
         }
@@ -661,6 +685,13 @@ impl<A: App> ApplicationHandler for Shell<A> {
         }
     }
 
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        // The pointer's own movement, which is all there is of it while it is held.
+        if let (true, winit::event::DeviceEvent::MouseMotion { delta }) = (self.captured, event) {
+            self.dispatch(Event::PointerMotion { delta: Point::new(delta.0 as f32, delta.1 as f32) });
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gpu) = &mut self.gpu else { return };
         let scale = gpu.window.scale_factor() as f32;
@@ -688,7 +719,10 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 self.report_frame();
                 self.sync_window();
             }
-            WindowEvent::ScaleFactorChanged { .. } => gpu.window.request_redraw(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.ui.set_scale(scale_factor as f32);
+                gpu.window.request_redraw();
+            }
             WindowEvent::Occluded(hidden) => {
                 self.hidden = hidden;
                 if !hidden {
@@ -705,6 +739,13 @@ impl<A: App> ApplicationHandler for Shell<A> {
             WindowEvent::Focused(f) => {
                 self.blur_strength = None;
                 self.blur_attempts = 0;
+                // The pointer is not kept from someone who has gone elsewhere.
+                if !f && self.captured {
+                    let _ = gpu.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                    gpu.window.set_cursor_visible(true);
+                    self.captured = false;
+                    self.dispatch(Event::PointerCaptureLost);
+                }
                 self.dispatch(Event::WindowFocus(f));
             }
             WindowEvent::RedrawRequested => self.render(),

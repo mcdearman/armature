@@ -206,6 +206,11 @@ pub enum WindowRequest {
     Minimize,
     ToggleMaximize,
     Close,
+    /// Hold the pointer in the window and hide it, or let it go: for
+    /// looking around in a game. While it is held the pointer's movement
+    /// arrives as [`Event::PointerMotion`](crate::Event::PointerMotion),
+    /// and it is let go when the window loses the keyboard.
+    CapturePointer(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,6 +294,8 @@ pub(crate) struct RuntimeState {
     pub clipboard_reader: Option<Box<dyn FnMut() -> Option<String>>>,
     /// Messages sent outside the event pass, as the app's message type.
     pub deferred: Vec<Box<dyn std::any::Any>>,
+    /// Physical pixels to a logical one, as the shell last said; 0 until it has.
+    pub scale: f32,
 }
 
 /// Context handed to every widget method.
@@ -402,6 +409,12 @@ impl<'a, 'b> Cx<'a, 'b> {
     /// Latest pointer position in window coordinates.
     pub fn pointer(&self) -> Option<Point> {
         self.shared.runtime.pointer
+    }
+
+    /// Physical pixels to a logical one on the screen the window is on: a
+    /// widget `w` wide covers `w × scale` pixels.
+    pub fn scale(&self) -> f32 {
+        if self.shared.runtime.scale > 0.0 { self.shared.runtime.scale } else { 1.0 }
     }
 
     pub fn is_hovered(&self) -> bool {

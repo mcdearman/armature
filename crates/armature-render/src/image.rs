@@ -18,6 +18,9 @@ struct Pixels {
     height: u32,
     /// Level 0 is the full image; each further level is half the size.
     levels: Vec<Vec<u8>>,
+    /// A texture of the app's own to draw from, in place of pixels: see
+    /// [`Image::from_texture`].
+    view: Option<wgpu::TextureView>,
 }
 
 /// A picture to draw with [`Scene::image`]: sRGB, straight-alpha RGBA
@@ -80,21 +83,39 @@ impl Image {
             levels.push(next);
             (w, h) = (nw, nh);
         }
-        Self(Arc::new(Pixels { slot: NEXT_SLOT.fetch_add(1, Ordering::Relaxed), version: 0, width, height, levels }))
+        Self(Arc::new(Pixels { slot: NEXT_SLOT.fetch_add(1, Ordering::Relaxed), version: 0, width, height, levels, view: None }))
     }
 
     /// An image with no smaller copies: quick to make, for video frames and
     /// pictures drawn near their own size.
     pub fn frame(width: u32, height: u32, rgba: Vec<u8>) -> Self {
         assert_eq!(rgba.len(), width as usize * height as usize * 4, "image data does not match its size");
-        Self(Arc::new(Pixels { slot: NEXT_SLOT.fetch_add(1, Ordering::Relaxed), version: 0, width, height, levels: vec![rgba] }))
+        Self(Arc::new(Pixels { slot: NEXT_SLOT.fetch_add(1, Ordering::Relaxed), version: 0, width, height, levels: vec![rgba], view: None }))
     }
 
     /// The next frame of the same picture, such as a video. It reuses this
     /// image's texture when the size is unchanged.
     pub fn next_frame(&self, width: u32, height: u32, rgba: Vec<u8>) -> Self {
         assert_eq!(rgba.len(), width as usize * height as usize * 4, "image data does not match its size");
-        Self(Arc::new(Pixels { slot: self.0.slot, version: self.0.version + 1, width, height, levels: vec![rgba] }))
+        Self(Arc::new(Pixels { slot: self.0.slot, version: self.0.version + 1, width, height, levels: vec![rgba], view: None }))
+    }
+
+    /// A picture that is a texture the app draws into itself, on the device
+    /// it was given (see `armature::App::graphics`): a game's frame, shown
+    /// in a window. `width` and `height` are the texture's, in pixels.
+    ///
+    /// The view must be of a two-dimensional texture that can be sampled
+    /// and filtered, created with `TEXTURE_BINDING`, and what is read
+    /// through it should be sRGB-encoded colour, as a picture's pixels
+    /// are: for a texture drawn into as `Rgba8UnormSrgb`, a view of it as
+    /// `Rgba8Unorm`. Its alpha is taken as straight alpha.
+    ///
+    /// Nothing is kept from one of these to the next: an app that makes
+    /// its texture anew, when its size changes say, makes a new image from
+    /// the new view, and the old texture is let go a few frames after it
+    /// was last drawn.
+    pub fn from_texture(view: wgpu::TextureView, width: u32, height: u32) -> Self {
+        Self(Arc::new(Pixels { slot: NEXT_SLOT.fetch_add(1, Ordering::Relaxed), version: 0, width, height, levels: vec![], view: Some(view) }))
     }
 
     pub fn width(&self) -> u32 {
@@ -127,7 +148,8 @@ struct Instance {
 
 struct Texture {
     bind_group: wgpu::BindGroup,
-    texture: wgpu::Texture,
+    /// None for a texture of the app's own, which is not this one's to write.
+    texture: Option<wgpu::Texture>,
     version: u64,
     size: (u32, u32),
     last_used: u64,
@@ -207,6 +229,18 @@ impl ImageRenderer {
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, image: &Image) {
         let p = &image.0;
+        // A texture of the app's own is drawn from as it is.
+        if let Some(view) = &p.view {
+            if !self.textures.contains_key(&p.slot) {
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("armature image from a texture"),
+                    layout: &self.layout,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
+                });
+                self.textures.insert(p.slot, Texture { bind_group, texture: None, version: 0, size: (p.width, p.height), last_used: self.frame });
+            }
+            return;
+        }
         // Photos larger than the GPU allows start from a smaller copy.
         let mut first = 0;
         let (mut w, mut h) = (p.width, p.height);
@@ -218,7 +252,7 @@ impl ImageRenderer {
             return;
         }
         let levels = &p.levels[first..];
-        let reuse = self.textures.get(&p.slot).is_some_and(|t| t.size == (w, h) && t.texture.mip_level_count() == levels.len() as u32);
+        let reuse = self.textures.get(&p.slot).is_some_and(|t| t.size == (w, h) && t.texture.as_ref().is_some_and(|x| x.mip_level_count() == levels.len() as u32));
         if !reuse {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("armature image"),
@@ -237,17 +271,18 @@ impl ImageRenderer {
                 layout: &self.layout,
                 entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
             });
-            self.textures.insert(p.slot, Texture { bind_group, texture, version: u64::MAX, size: (w, h), last_used: self.frame });
+            self.textures.insert(p.slot, Texture { bind_group, texture: Some(texture), version: u64::MAX, size: (w, h), last_used: self.frame });
         }
         let entry = self.textures.get_mut(&p.slot).expect("inserted above");
         if entry.version == p.version {
             return;
         }
         entry.version = p.version;
+        let Some(texture) = &entry.texture else { return };
         let (mut lw, mut lh) = (w, h);
         for (i, data) in levels.iter().enumerate() {
             queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &entry.texture, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 data,
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(lw * 4), rows_per_image: Some(lh) },
                 wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
