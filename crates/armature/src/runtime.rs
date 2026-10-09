@@ -29,6 +29,8 @@ pub struct Ui<A: App> {
     needs_layout: bool,
     timers: Vec<(Duration, Instant)>,
     inbox: Option<Receiver<A::Message>>,
+    /// Where the last frame drew something: see [`Ui::hit`].
+    drawn: Option<armature_render::Cover>,
 }
 
 impl<A: App> Ui<A> {
@@ -51,6 +53,7 @@ impl<A: App> Ui<A> {
             needs_layout: true,
             timers: vec![],
             inbox: None,
+            drawn: None,
         }
     }
 
@@ -301,11 +304,28 @@ impl<A: App> Ui<A> {
         let mut shared = Shared { text, style: self.style.clone(), scheme: self.system_scheme, states: &mut self.states, runtime: &mut self.rt };
         let mut cx = DrawCx { cx: Cx { shared: &mut shared, id: WidgetId(0), bounds: root.bounds() }, scene: &mut scene };
         root.draw(&mut cx);
+        self.drawn = Some(scene.cover());
         scene
     }
 
+    /// Whether the interface has anything at `p`, as it was last drawn: a
+    /// panel, a control, a line of text. For a host that draws this over
+    /// something of its own (see `Renderer::render_over`) and needs to know
+    /// whether the pointer is on the interface or on what is behind it.
+    /// False until a frame has been drawn.
+    pub fn hit(&self, p: Point) -> bool {
+        self.drawn.as_ref().is_some_and(|cover| cover.covers(p))
+    }
+
     /// Routes an input event, then applies any resulting messages.
-    pub fn event(&mut self, text: &mut TextSystem, event: Event) {
+    ///
+    /// Says whether the interface took it, for a host that shares its
+    /// input with something else: [`Status::Captured`] if a widget used it,
+    /// if it was a key the app or its menus act on, or if it was a press, a
+    /// release or the wheel over something the interface has drawn, which
+    /// is not then meant for what is behind. A host with nothing behind the
+    /// interface has no use for the answer.
+    pub fn event(&mut self, text: &mut TextSystem, event: Event) -> Status {
         self.ensure(text);
         if let Event::Key(k) = &event {
             self.rt.modifiers = k.modifiers;
@@ -330,6 +350,7 @@ impl<A: App> Ui<A> {
             let mut cx = EventCx { cx: Cx { shared: &mut shared, id: WidgetId(0), bounds: root.bounds() }, messages: &mut messages };
             root.event(&mut cx, &event)
         };
+        let mut status = status;
         if let Event::Key(k) = &event
             && status == Status::Ignored
             && k.pressed
@@ -337,9 +358,17 @@ impl<A: App> Ui<A> {
             // A menu entry's shortcut comes first, then the app's own keys.
             if let Some(m) = crate::menu::shortcut_message(&crate::menu::with_app_entries(self.app.menus(), self.app.app_menu()), k).or_else(|| self.app.on_key(k)) {
                 messages.push(m);
-            } else if k.key == Key::Tab {
+                status = Status::Captured;
+            } else if k.key == Key::Tab && !self.rt.focus_chain.is_empty() {
                 self.move_focus(!k.modifiers.shift);
+                status = Status::Captured;
             }
+        }
+        // On the interface, though no widget there had a use for it.
+        if let Event::PointerPressed { pos, .. } | Event::PointerReleased { pos, .. } | Event::Wheel { pos, .. } = &event
+            && self.hit(*pos)
+        {
+            status = Status::Captured;
         }
         if let Event::WindowFocus(focused) = &event
             && let Some(m) = self.app.on_window_focus(*focused)
@@ -355,6 +384,7 @@ impl<A: App> Ui<A> {
             self.needs_layout = true;
         }
         self.rt.clipboard_in = None;
+        status
     }
 
     fn move_focus(&mut self, forward: bool) {

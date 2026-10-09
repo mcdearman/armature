@@ -83,7 +83,9 @@ pub struct Renderer {
 
     blit_bgl: wgpu::BindGroupLayout,
     blit_shader: wgpu::ShaderModule,
-    blit_pipelines: Vec<(SurfaceTarget, wgpu::RenderPipeline)>,
+    /// One for each kind of surface drawn onto, and for whether the canvas
+    /// replaces what is there or is laid over it.
+    blit_pipelines: Vec<((SurfaceTarget, bool), wgpu::RenderPipeline)>,
 
     canvas: Option<Target>,
 
@@ -589,8 +591,8 @@ impl Renderer {
         0
     }
 
-    fn blit_pipeline(&mut self, target: SurfaceTarget) -> usize {
-        if let Some(i) = self.blit_pipelines.iter().position(|(t, _)| *t == target) {
+    fn blit_pipeline(&mut self, target: SurfaceTarget, over: bool) -> usize {
+        if let Some(i) = self.blit_pipelines.iter().position(|(t, _)| *t == (target, over)) {
             return i;
         }
         let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -618,19 +620,40 @@ impl Renderer {
                 module: &self.blit_shader,
                 entry_point: Some("fs"),
                 compilation_options: wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() },
-                targets: &[Some(wgpu::ColorTargetState { format: target.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState { format: target.format, blend: over.then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
             }),
             multiview_mask: None,
             cache: None,
         });
-        self.blit_pipelines.push((target, pipeline));
+        self.blit_pipelines.push(((target, over), pipeline));
         self.blit_pipelines.len() - 1
     }
 
-    /// Renders `scene` onto a window surface texture.
+    /// Renders `scene` onto a window surface texture, in place of whatever
+    /// was there.
     pub fn render(&mut self, scene: &Scene, target: &wgpu::TextureView, surface: SurfaceTarget, width: u32, height: u32, scale: f32) {
+        self.present(scene, target, surface, width, height, scale, false);
+    }
+
+    /// Renders `scene` over what `target` already holds: for a host that
+    /// has drawn a frame of its own there, a game's say, and wants an
+    /// interface on top of it. Where the scene draws nothing the host's
+    /// picture shows, and where it draws something see-through the two are
+    /// blended.
+    ///
+    /// The scene should be one started transparent, as `Ui::draw` gives.
+    /// `surface.unpremultiply` is not used: what is laid over is blended as
+    /// premultiplied colour. A glass surface blurs only what this renderer
+    /// drew beneath it, not the host's picture, which it cannot see; a
+    /// theme for use here should leave glass off.
+    pub fn render_over(&mut self, scene: &Scene, target: &wgpu::TextureView, surface: SurfaceTarget, width: u32, height: u32, scale: f32) {
+        self.present(scene, target, SurfaceTarget { unpremultiply: false, ..surface }, width, height, scale, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present(&mut self, scene: &Scene, target: &wgpu::TextureView, surface: SurfaceTarget, width: u32, height: u32, scale: f32, over: bool) {
         let mut encoder = self.draw(scene, width, height, scale);
-        let pi = self.blit_pipeline(surface);
+        let pi = self.blit_pipeline(surface, over);
         let canvas = self.canvas.as_ref().unwrap();
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("armature blit"),
@@ -644,7 +667,7 @@ impl Renderer {
                     view: target,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations { load: if over { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) }, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,

@@ -20,7 +20,7 @@ pub use geometry::{Corners, Point, Rect, Size};
 pub use renderer::{Renderer, SurfaceTarget, CANVAS_FORMAT};
 pub use image::Image;
 pub use paint::{Paint, Shadow};
-pub use scene::Scene;
+pub use scene::{Cover, Scene};
 pub use text::{FontFamily, Fonts, TextLayout, TextStyle, TextSystem};
 
 pub use wgpu;

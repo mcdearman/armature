@@ -37,4 +37,4 @@ pub use menu::{with_app_entries, Menu, MenuEntry, Shortcut};
 pub use runtime::Ui;
 pub use shell::{on_menu_chosen, run, Error};
 
-pub use armature_render::{Color, Corners, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, TextLayout, TextStyle};
+pub use armature_render::{Color, Corners, Cover, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, TextLayout, TextStyle};

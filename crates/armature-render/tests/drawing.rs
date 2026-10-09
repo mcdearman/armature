@@ -185,3 +185,98 @@ fn the_scale_factor_multiplies_pixels() {
     assert_eq!((at2(20, 20), at2(59, 59)), (RED, RED));
     assert_eq!((at2(19, 30), at2(60, 30)), (WHITE, WHITE));
 }
+
+#[test]
+fn where_a_scene_draws_something_is_known_without_drawing_it() {
+    let mut scene = Scene::new(Color::TRANSPARENT);
+    assert!(!scene.covers(Point::new(5.0, 5.0)), "an empty scene covers nothing");
+    scene.shadow(Rect::new(10.0, 10.0, 30.0, 30.0), 0.0, &Shadow { color: Color::BLACK.with_alpha(0.5), blur: 20.0, offset: (0.0, 20.0), spread: 0.0, inset: false });
+    scene.fill(Rect::new(10.0, 10.0, 30.0, 30.0), 4.0, red(), None);
+    scene.fill(Rect::new(60.0, 10.0, 30.0, 30.0), 0.0, Color::TRANSPARENT, None);
+    scene.fill(Rect::new(60.0, 60.0, 30.0, 30.0), 0.0, Color::TRANSPARENT, Some((2.0, blue())));
+    scene.push_clip(Rect::new(0.0, 60.0, 20.0, 40.0));
+    scene.push_offset(Point::new(0.0, 60.0));
+    scene.fill(Rect::new(0.0, 0.0, 50.0, 30.0), 0.0, blue(), None);
+    scene.pop_offset();
+    scene.pop_clip();
+    let cover = scene.cover();
+    for (p, covered, what) in [
+        (Point::new(20.0, 20.0), true, "a fill"),
+        (Point::new(20.0, 50.0), false, "a shadow is not something to click"),
+        (Point::new(70.0, 20.0), false, "a fill that cannot be seen"),
+        (Point::new(70.0, 70.0), true, "an outline round nothing"),
+        (Point::new(10.0, 70.0), true, "inside its clip, where it was moved to"),
+        (Point::new(30.0, 70.0), false, "cut off by its clip"),
+        (Point::new(95.0, 95.0), false, "nothing at all"),
+    ] {
+        assert_eq!((cover.covers(p), scene.covers(p)), (covered, covered), "{what}");
+    }
+}
+
+/// What a 100 by 100 target of `format` holds after it is filled with blue
+/// and `scene` is drawn over it: its bytes as they are stored.
+fn over_blue(format: wgpu::TextureFormat, scene: &Scene) -> Vec<u8> {
+    let mut renderer = Renderer::headless(Fonts::system()).expect("a GPU adapter is required for these tests");
+    let side = W as u32;
+    let texture = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("a host's frame"),
+        size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    // The host's own frame: blue all over.
+    let mut encoder = renderer.device().create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("the host draws"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLUE), store: wgpu::StoreOp::Store } })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    }));
+    renderer.queue().submit(Some(encoder.finish()));
+    let surface = armature_render::SurfaceTarget { format, unpremultiply: true };
+    renderer.render_over(scene, &view, surface, side, side, 1.0);
+    // Twice, as a host does frame after frame: the second is laid over the first.
+    renderer.render_over(&Scene::new(Color::TRANSPARENT), &view, surface, side, side, 1.0);
+
+    let row = (side * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = renderer.device().create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * side) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = renderer.device().create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(side) } },
+        wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+    );
+    renderer.queue().submit(Some(encoder.finish()));
+    buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("map readback buffer"));
+    renderer.device().poll(wgpu::PollType::wait_indefinitely()).expect("poll device");
+    let data = buffer.get_mapped_range(..).expect("mapped range");
+    (0..side).flat_map(|y| data[(y * row) as usize..(y * row + side * 4) as usize].to_vec()).collect()
+}
+
+#[test]
+fn a_scene_is_drawn_over_what_the_target_already_holds() {
+    let mut scene = Scene::new(Color::TRANSPARENT);
+    scene.fill(Rect::new(10.0, 10.0, 30.0, 30.0), 0.0, Color::hex(0x00ff00), None);
+    scene.fill(Rect::new(60.0, 60.0, 30.0, 30.0), 0.0, red().with_alpha(0.5), None);
+    // Stored plainly, the colours are mixed as they stand; on an sRGB target
+    // the system mixes light, and an even mix of red and blue is brighter.
+    for (format, mixed, swap) in [(wgpu::TextureFormat::Rgba8Unorm, 128, false), (wgpu::TextureFormat::Rgba8UnormSrgb, 188, false), (wgpu::TextureFormat::Bgra8UnormSrgb, 188, true)] {
+        let px = over_blue(format, &scene);
+        let at = |x: usize, y: usize| {
+            let [a, b, c] = at(&px, x, y);
+            if swap { [c, b, a] } else { [a, b, c] }
+        };
+        assert_eq!(at(50, 50), BLUE, "{format:?}: where nothing is drawn, what was there shows");
+        assert_eq!(at(95, 5), BLUE, "{format:?}");
+        assert_eq!(at(25, 25), [0, 255, 0], "{format:?}: something solid covers it");
+        assert!(near(at(75, 75), [mixed, 0, mixed], 3), "{format:?}: something see-through is mixed with it, got {:?}", at(75, 75));
+        assert_eq!(px[(50 * W + 50) * 4 + 3], 255, "{format:?}: and the target stays solid");
+    }
+}

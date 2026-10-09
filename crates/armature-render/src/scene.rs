@@ -47,6 +47,19 @@ pub(crate) struct Layer {
     pub backdrop_blur: f32,
 }
 
+/// Where a scene draws something, kept after the scene itself has gone
+/// to the renderer. For a host that draws a scene over something of its
+/// own, and has to know which of the two a click is meant for.
+#[derive(Clone, Debug, Default)]
+pub struct Cover(Vec<(Rect, Option<Rect>)>);
+
+impl Cover {
+    /// Whether anything was drawn at `p`.
+    pub fn covers(&self, p: Point) -> bool {
+        self.0.iter().any(|(rect, clip)| rect.contains(p) && clip.is_none_or(|c| c.contains(p)))
+    }
+}
+
 /// A frame's display list in logical pixels.
 pub struct Scene {
     pub(crate) layers: Vec<Layer>,
@@ -260,6 +273,35 @@ impl Scene {
         let pos = pos + self.offset();
         let clip = self.clips.last().copied();
         self.layer().texts.push(TextItem { layout: layout.clone(), pos, color, clip });
+    }
+
+    /// Where the scene draws something: its filled shapes, pictures and
+    /// lines of text, each within whatever clipped it. Shadows do not
+    /// count, nor does a fill too faint to see.
+    pub fn cover(&self) -> Cover {
+        let clip = |c: [f32; 4]| (c[2] >= 0.0).then(|| Rect::new(c[0], c[1], c[2], c[3]));
+        let mut drawn = vec![];
+        for layer in &self.layers {
+            for s in &layer.shapes {
+                let solid = [kind::FILL, kind::GRADIENT, kind::BACKDROP, kind::AREA].contains(&s.params[0]);
+                // A fill, or the border round an empty one.
+                let seen = s.color[3] > 0.02 || s.color2[3] > 0.02 && (s.params[0] != kind::FILL || s.params[1] > 0.0);
+                if solid && seen {
+                    drawn.push((Rect::new(s.rect[0], s.rect[1], s.rect[2], s.rect[3]), clip(s.clip)));
+                }
+            }
+            drawn.extend(layer.images.iter().filter(|i| i.opacity > 0.02).map(|i| (i.rect, clip(i.clip))));
+            drawn.extend(layer.texts.iter().filter(|t| t.color.a > 0.02).map(|t| {
+                let size = t.layout.size();
+                (Rect::new(t.pos.x, t.pos.y, size.w, size.h), t.clip)
+            }));
+        }
+        Cover(drawn)
+    }
+
+    /// Whether anything is drawn at `p`: see [`cover`](Self::cover).
+    pub fn covers(&self, p: Point) -> bool {
+        self.cover().covers(p)
     }
 
     /// Number of shapes and text runs, for tests and diagnostics.

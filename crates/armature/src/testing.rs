@@ -49,12 +49,14 @@ impl<A: App> Harness<A> {
         self.ui.resize(size);
     }
 
-    pub fn event(&mut self, e: Event) {
-        self.ui.event(self.renderer.text(), e);
+    /// Sends an event, and says whether the interface took it: see [`Ui::event`].
+    pub fn event(&mut self, e: Event) -> crate::Status {
+        let status = self.ui.event(self.renderer.text(), e);
         self.ui.refresh(self.renderer.text());
         if let Some(t) = self.ui.take_clipboard() {
             *self.clipboard.borrow_mut() = Some(t);
         }
+        status
     }
 
     /// The simulated system clipboard: what widgets last copied, or what
