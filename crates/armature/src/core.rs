@@ -614,6 +614,13 @@ impl<M> Element<M> {
         size
     }
 
+    /// Whether this element itself has the keyboard: for a widget that
+    /// wraps another and treats a key differently while the one inside is
+    /// being typed in.
+    pub fn has_focus(&self, cx: &Cx) -> bool {
+        cx.shared.runtime.focus == Some(self.id) && cx.shared.runtime.window_focused
+    }
+
     /// Sets this element's position relative to its parent's origin.
     pub fn set_position(&mut self, p: Point) {
         self.rel = p;
