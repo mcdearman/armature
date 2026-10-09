@@ -40,4 +40,4 @@ pub use shell::{on_menu_chosen, run, Error};
 /// The graphics library everything here is drawn with, for an app that
 /// draws with the same device: see [`App::graphics`].
 pub use armature_render::wgpu;
-pub use armature_render::{Color, Corners, Cover, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, TextLayout, TextStyle};
+pub use armature_render::{Color, Corners, Cover, FontFamily, Fonts, Image, Paint, Point, Rect, Scene, Shadow, Size, Span, TextLayout, TextStyle};

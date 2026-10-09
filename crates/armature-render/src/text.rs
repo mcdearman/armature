@@ -55,6 +55,24 @@ impl Fonts {
     }
 }
 
+/// A stretch of text in one manner, for [`TextSystem::layout_rich`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Span<'a> {
+    pub text: &'a str,
+    /// A colour of its own, or the one given when it is drawn.
+    pub color: Option<crate::Color>,
+    pub bold: bool,
+    pub italic: bool,
+    /// In the fixed-width face.
+    pub mono: bool,
+}
+
+impl<'a> Span<'a> {
+    pub fn plain(text: &'a str) -> Self {
+        Self { text, ..Self::default() }
+    }
+}
+
 /// Shaped text, cheap to clone.
 #[derive(Clone)]
 pub struct TextLayout {
@@ -73,6 +91,19 @@ impl TextLayout {
     /// The bounding size of the laid-out text.
     pub fn size(&self) -> Size {
         self.size
+    }
+
+    /// Which byte of the text is at `p`, measured from the layout's own
+    /// top left corner: for finding the word, or the link, under the
+    /// pointer. Nothing, if that is off the text.
+    pub fn index_at(&self, p: Point) -> Option<usize> {
+        if p.x < 0.0 || p.y < 0.0 || p.x > self.size.w || p.y > self.size.h {
+            return None;
+        }
+        let cursor = self.buffer.hit(p.x, p.y)?;
+        // The lines before it, each with the line end that was taken off it.
+        let before: usize = self.buffer.lines.iter().take(cursor.line).map(|l| l.text().len() + 1).sum();
+        Some(before + cursor.index)
     }
 
     pub fn line_height(&self) -> f32 {
@@ -119,8 +150,8 @@ impl TextLayout {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     text: String,
-    /// Byte length and RGBA of each coloured span; empty for plain text.
-    spans: Vec<(usize, [u8; 4])>,
+    /// Byte length, RGBA and manner of each span; empty for plain text.
+    spans: Vec<(usize, [u8; 4], u8)>,
     size: u32,
     weight: u16,
     family: FontFamily,
@@ -168,11 +199,20 @@ impl TextSystem {
     /// Spans with no colour of their own use the colour passed when drawing.
     pub fn layout_spans(&mut self, spans: &[(&str, Option<crate::Color>)], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
         let text: String = spans.iter().map(|(t, _)| *t).collect();
-        let colors: Vec<(usize, [u8; 4])> = spans.iter().map(|(t, c)| (t.len(), c.map_or([0; 4], |c| c.to_rgba8()))).collect();
+        let colors: Vec<(usize, [u8; 4], u8)> = spans.iter().map(|(t, c)| (t.len(), c.map_or([0; 4], |c| c.to_rgba8()), 0)).collect();
         self.layout_inner(&text, &colors, style, max_width)
     }
 
-    fn layout_inner(&mut self, text: &str, spans: &[(usize, [u8; 4])], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
+    /// Shapes spans that differ in more than colour as one run of text
+    /// that wraps as one: words in bold or italic, or in the fixed-width
+    /// face, within a sentence. For prose with emphasis in it.
+    pub fn layout_rich(&mut self, spans: &[Span<'_>], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
+        let text: String = spans.iter().map(|s| s.text).collect();
+        let manner: Vec<(usize, [u8; 4], u8)> = spans.iter().map(|s| (s.text.len(), s.color.map_or([0; 4], |c| c.to_rgba8()), u8::from(s.bold) | u8::from(s.italic) << 1 | u8::from(s.mono) << 2)).collect();
+        self.layout_inner(&text, &manner, style, max_width)
+    }
+
+    fn layout_inner(&mut self, text: &str, spans: &[(usize, [u8; 4], u8)], style: &TextStyle, max_width: Option<f32>) -> TextLayout {
         let key = Key {
             text: text.to_owned(),
             spans: spans.to_vec(),
@@ -212,10 +252,19 @@ impl TextSystem {
             buffer.set_text(text, &attrs, Shaping::Advanced, None);
         } else {
             let mut at = 0;
-            let rich = spans.iter().map(|(len, rgba)| {
+            let rich = spans.iter().map(|(len, rgba, manner)| {
                 let t = &text[at..at + len];
                 at += len;
-                let a = if rgba[3] == 0 { attrs.clone() } else { attrs.clone().color(glyphon::Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3])) };
+                let mut a = if rgba[3] == 0 { attrs.clone() } else { attrs.clone().color(glyphon::Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3])) };
+                if manner & 1 != 0 {
+                    a = a.weight(Weight(style.weight.max(400) + 300));
+                }
+                if manner & 2 != 0 {
+                    a = a.style(glyphon::Style::Italic);
+                }
+                if manner & 4 != 0 {
+                    a = a.family(Family::Monospace);
+                }
                 (t, a)
             });
             buffer.set_rich_text(rich, &attrs, Shaping::Advanced, None);

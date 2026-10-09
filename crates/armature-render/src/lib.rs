@@ -21,6 +21,6 @@ pub use renderer::{Renderer, SurfaceTarget, CANVAS_FORMAT};
 pub use image::Image;
 pub use paint::{Paint, Shadow};
 pub use scene::{Cover, Scene};
-pub use text::{FontFamily, Fonts, TextLayout, TextStyle, TextSystem};
+pub use text::{FontFamily, Fonts, Span, TextLayout, TextStyle, TextSystem};
 
 pub use wgpu;

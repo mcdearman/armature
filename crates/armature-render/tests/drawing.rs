@@ -280,3 +280,27 @@ fn a_scene_is_drawn_over_what_the_target_already_holds() {
         assert_eq!(px[(50 * W + 50) * 4 + 3], 255, "{format:?}: and the target stays solid");
     }
 }
+
+#[test]
+fn words_in_another_manner_are_part_of_the_same_wrapped_text() {
+    use armature_render::{Span, TextStyle};
+    let mut renderer = Renderer::headless(Fonts::system()).expect("a GPU adapter is required for these tests");
+    let style = TextStyle { size: 16.0, ..TextStyle::default() };
+    let words = "a few words set in one line to be measured";
+    let plain = renderer.text().layout(words, &style, None);
+    let rich = |r: &mut Renderer, bold: bool, mono: bool, width: Option<f32>| r.text().layout_rich(&[Span::plain("a few words "), Span { text: "set in one line", bold, mono, ..Span::default() }, Span::plain(" to be measured")], &style, width);
+    assert_eq!(rich(&mut renderer, false, false, None).size(), plain.size(), "spans in the same manner are the same text");
+    let bold = rich(&mut renderer, true, false, None);
+    assert!(bold.size().w > plain.size().w && bold.size().h == plain.size().h, "bold words are wider, on the same line");
+    assert!(rich(&mut renderer, false, true, None).size().w != plain.size().w, "and so are words in the fixed-width face");
+    // Too wide for its place, it wraps as one piece of text, not span by span.
+    let wrapped = rich(&mut renderer, true, false, Some(plain.size().w / 2.0));
+    assert!(wrapped.size().h >= plain.size().h * 2.0 && wrapped.size().w <= plain.size().w / 2.0 + 1.0);
+    // The character under a point: the first line's start, and nothing off the text.
+    assert_eq!(plain.index_at(Point::new(1.0, 2.0)), Some(0));
+    let far = plain.index_at(Point::new(plain.size().w - 2.0, 2.0)).unwrap();
+    assert!(far >= words.len() - 2, "{far}");
+    assert_eq!((plain.index_at(Point::new(-4.0, 2.0)), plain.index_at(Point::new(5.0, 400.0))), (None, None));
+    let second = wrapped.index_at(Point::new(2.0, wrapped.size().h - 2.0)).unwrap();
+    assert!(second > 10, "on the last line, well into the text: {second}");
+}
