@@ -395,6 +395,10 @@ impl<A: App> Ui<A> {
                 status = Status::Captured;
             }
         }
+        // What was being carried and nobody took is let fall.
+        if matches!(event, Event::PointerReleased { .. } | Event::PointerLeft) && self.rt.drag.take().is_some() {
+            self.rt.redraw = true;
+        }
         // On the interface, though no widget there had a use for it.
         if let Event::PointerPressed { pos, .. } | Event::PointerReleased { pos, .. } | Event::Wheel { pos, .. } = &event
             && self.hit(*pos)

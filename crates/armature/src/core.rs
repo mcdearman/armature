@@ -296,6 +296,8 @@ pub(crate) struct RuntimeState {
     pub deferred: Vec<Box<dyn std::any::Any>>,
     /// Physical pixels to a logical one, as the shell last said; 0 until it has.
     pub scale: f32,
+    /// Something being dragged from one widget to another: see `Cx::start_drag`.
+    pub drag: Option<Box<dyn std::any::Any>>,
 }
 
 /// Context handed to every widget method.
@@ -409,6 +411,32 @@ impl<'a, 'b> Cx<'a, 'b> {
     /// Latest pointer position in window coordinates.
     pub fn pointer(&self) -> Option<Point> {
         self.shared.runtime.pointer
+    }
+
+    /// Begins carrying `payload` with the pointer, for another widget to
+    /// be given when the button is let go over it: a row of a tree
+    /// dragged onto a field, a file onto a view. Call it while handling
+    /// the pointer movement that made the press a drag. It is dropped,
+    /// whether or not anything took it, when the button is released.
+    pub fn start_drag<T: 'static>(&mut self, payload: T) {
+        self.shared.runtime.drag = Some(Box::new(payload));
+        self.shared.runtime.redraw = true;
+    }
+
+    /// What is being carried, if it is a `T`: for a widget to show, while
+    /// the pointer is over it, that it would take it.
+    pub fn dragged<T: 'static>(&self) -> Option<&T> {
+        self.shared.runtime.drag.as_ref()?.downcast_ref()
+    }
+
+    /// Takes what is being carried, if it is a `T`: for the widget it is
+    /// let go over, when the button is released. Nothing else then gets it.
+    pub fn take_drag<T: 'static>(&mut self) -> Option<T> {
+        if !self.shared.runtime.drag.as_ref()?.is::<T>() {
+            return None;
+        }
+        self.shared.runtime.redraw = true;
+        self.shared.runtime.drag.take()?.downcast().ok().map(|b| *b)
     }
 
     /// Physical pixels to a logical one on the screen the window is on: a
