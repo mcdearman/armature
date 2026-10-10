@@ -108,6 +108,7 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         blur_strength: None,
         blur_attempts: 0,
         captured: false,
+        unseen_at: None,
         hidden: false,
         retry_at: None,
         state: None,
@@ -153,6 +154,8 @@ struct Shell<A: App> {
     /// The pointer is held in the window and hidden: see
     /// [`WindowRequest::CapturePointer`].
     captured: bool,
+    /// When an app that goes on unseen is next to be stepped: see `App::steps_unseen`.
+    unseen_at: Option<Instant>,
     /// The window is fully covered, minimised or on a sleeping display, so
     /// nothing is drawn until it is visible again.
     hidden: bool,
@@ -887,6 +890,18 @@ impl<A: App> ApplicationHandler for Shell<A> {
             }
         if let Some(t) = self.retry_at.filter(|_| !self.hidden) {
             wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
+        // Out of sight, no frame is drawn; an app that wants to go on all the
+        // same is stepped without one, at a gentler pace.
+        if self.gpu.is_some() && !self.can_draw() && self.ui.needs_redraw() && self.ui.app().steps_unseen() {
+            if self.unseen_at.is_none_or(|t| t <= now) {
+                self.ui.step(now);
+                self.unseen_at = Some(now + Duration::from_millis(100));
+            }
+            let t = self.unseen_at.unwrap_or(now);
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        } else {
+            self.unseen_at = None;
         }
         self.sync_window();
         if self.close || self.ui.should_exit() {

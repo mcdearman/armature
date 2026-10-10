@@ -96,6 +96,16 @@ pub trait App: 'static {
         false
     }
 
+    /// Whether [`step`](Self::step) goes on being called while the window
+    /// cannot be seen: covered, minimised, or hidden. No frame is drawn
+    /// then, so by default nothing is stepped either; an app whose work
+    /// goes on unseen, a game that others talk to, returns true, and is
+    /// stepped ten times a second for as long as something on its page
+    /// wants frames.
+    fn steps_unseen(&self) -> bool {
+        false
+    }
+
     /// Key presses no widget handled, for app-wide shortcuts such as save.
     fn on_key(&self, _key: &KeyEvent) -> Option<Self::Message> {
         None
