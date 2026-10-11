@@ -52,6 +52,31 @@ pub(crate) fn set_square(window: &Window, square: bool) {
     let _ = (window, square);
 }
 
+/// Has the platform round the corners of a window the app decorates, or
+/// leave them square, and says whether it did. Where it does, the app must
+/// draw a plain rectangle: the platform cuts the corners off, the backdrop
+/// set up by [`set_blur`] with them, at a radius of its own choosing, and
+/// anything the app left clear outside a corner of its own would show that
+/// backdrop. Only Windows 11 does; elsewhere the app's own corners stand.
+pub(crate) fn round_corners(window: &Window, round: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND};
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|h| h.as_raw()) else {
+            return false;
+        };
+        let preference = if round { DWMWCP_ROUND } else { DWMWCP_DONOTROUND };
+        // Windows 10 does not know the attribute, and says so.
+        unsafe { DwmSetWindowAttribute(handle.hwnd.get() as _, DWMWA_WINDOW_CORNER_PREFERENCE as u32, (&raw const preference).cast(), size_of_val(&preference) as u32) == 0 }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, round);
+        false
+    }
+}
+
 /// Sets the strength of the platform blur set up by [`set_blur`], in logical
 /// pixels. Returns false when the platform's blur layers do not exist yet
 /// (macOS builds them lazily), so the caller should try again after the next
@@ -74,8 +99,8 @@ pub(crate) fn set_blur_strength(window: &Window, radius: f32) -> bool {
 ///
 /// - macOS 26+: clear Liquid Glass clipped to `radius`. Older macOS: a
 ///   behind-window `NSVisualEffectView` with the HUD material.
-/// - Windows 10/11: acrylic via DWM. Windows 11 rounds the blur with its own
-///   fixed corner, so `radius` is not applied.
+/// - Windows 10/11: acrylic via DWM, over the whole window, so `radius` is
+///   not applied. On Windows 11 [`round_corners`] cuts it to the window.
 /// - Linux, Wayland: KDE's blur protocol, over the whole surface for now.
 ///   Other compositors show the window translucent without blur.
 /// - Linux, X11: translucent only.

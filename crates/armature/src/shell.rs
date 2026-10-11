@@ -220,12 +220,32 @@ impl<A: App> Shell<A> {
                 attrs = attrs.with_decorations(true).with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true).with_titlebar_buttons_hidden(true);
             }
         }
+        #[cfg(target_os = "windows")]
+        {
+            // The window is drawn by composition alone. With a bitmap of its
+            // own behind it, what the app leaves clear comes out white.
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_no_redirection_bitmap(true).with_skip_taskbar(s.skip_taskbar);
+        }
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| Error::Graphics(e.to_string()))?);
         if let Some(t) = window.theme() {
             self.ui.set_system_scheme(scheme_of(t));
         }
+        if s.decorations == Decorations::Custom {
+            self.ui.set_platform_rounds(crate::platform::round_corners(&window, true));
+        }
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle())));
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+        let mut instance = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle()));
+        // Where Direct3D is what draws, its usual swapchain, made from the
+        // window, is opaque. One made from a composition visual is
+        // see-through, as a bare window and a glass one need.
+        #[cfg(target_os = "windows")]
+        {
+            instance.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        }
+        // `WGPU_BACKEND` and its like choose what draws, for trying another.
+        let instance = wgpu::Instance::new(instance.with_env());
         let surface = instance.create_surface(window.clone()).map_err(|e| Error::Graphics(e.to_string()))?;
         let (adapter, device, queue) = pollster::block_on(async {
             let adapter = instance
@@ -331,6 +351,10 @@ impl<A: App> Shell<A> {
         let glass = (self.ui.backdrop_blur().is_some() && !state.bare, if state.bare { 0.0 } else { self.ui.window_radius() });
         if self.glass != Some(glass) {
             crate::platform::set_blur(&gpu.window, glass.0, glass.1);
+            // A window with the system's own frame keeps the system's corners.
+            if self.settings.decorations == Decorations::Custom {
+                crate::platform::round_corners(&gpu.window, glass.1 > 0.0);
+            }
             self.glass = Some(glass);
             self.blur_strength = None;
             self.blur_attempts = 0;

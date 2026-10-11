@@ -294,7 +294,8 @@ pub struct Chrome {
     pub title: String,
     /// Draw a title bar with window controls.
     pub title_bar: bool,
-    /// Round the window's corners. False when maximized.
+    /// Round the window's corners. False when maximized, and where the
+    /// platform rounds them itself, as Windows 11 does.
     pub rounded: bool,
     /// Paint the window background. False for a bare, see-through window.
     pub background: bool,
@@ -399,10 +400,14 @@ pub struct WindowSettings {
     /// this is the Wayland app ID and X11 class, which must match the name
     /// of the app's `.desktop` file for docks and menus to show its icon.
     pub app_id: Option<String>,
+    /// Keep the window off the taskbar, for one that comes and goes at a
+    /// shortcut or shows only a notice, and is not a thing to switch to.
+    /// Windows only; elsewhere an app keeps out of the Dock in its own way.
+    pub skip_taskbar: bool,
 }
 
 impl Default for WindowSettings {
     fn default() -> Self {
-        Self { size: Size::new(960.0, 640.0), min_size: Some(Size::new(360.0, 240.0)), decorations: Decorations::Custom, resizable: true, app_id: None }
+        Self { size: Size::new(960.0, 640.0), min_size: Some(Size::new(360.0, 240.0)), decorations: Decorations::Custom, resizable: true, app_id: None, skip_taskbar: false }
     }
 }
