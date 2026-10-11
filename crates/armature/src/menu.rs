@@ -79,24 +79,33 @@ pub struct MenuEntry<M> {
     pub message: Option<M>,
     /// A dividing line; the other fields are unused.
     pub separator: bool,
+    /// A picture shown before the label, where the window draws its own
+    /// menus: the system's menu bar on macOS shows none.
+    pub icon: Option<armature_render::Image>,
 }
 
 impl<M> MenuEntry<M> {
     pub fn new(label: impl Into<String>, message: M) -> Self {
-        Self { label: label.into(), shortcut: None, message: Some(message), separator: false }
+        Self { label: label.into(), shortcut: None, message: Some(message), separator: false, icon: None }
     }
 
     /// An entry that is shown but cannot be chosen.
     pub fn disabled(label: impl Into<String>) -> Self {
-        Self { label: label.into(), shortcut: None, message: None, separator: false }
+        Self { label: label.into(), shortcut: None, message: None, separator: false, icon: None }
     }
 
     pub fn separator() -> Self {
-        Self { label: String::new(), shortcut: None, message: None, separator: true }
+        Self { label: String::new(), shortcut: None, message: None, separator: true, icon: None }
     }
 
     pub fn shortcut(mut self, s: Shortcut) -> Self {
         self.shortcut = Some(s);
+        self
+    }
+
+    /// A picture to show before the label.
+    pub fn icon(mut self, image: armature_render::Image) -> Self {
+        self.icon = Some(image);
         self
     }
 

@@ -273,5 +273,8 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
         return mix(premul(in.color), premul(in.color2), tt) * cov;
     }
 
-    discard;
+    // A kind that is not known draws nothing. Returned, not discarded:
+    // Direct3D's compiler will not take a function whose last path has no
+    // value, and nothing is what clear, premultiplied colour draws.
+    return vec4<f32>(0.0);
 }

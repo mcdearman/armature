@@ -21,6 +21,8 @@ pub struct Ui<A: App> {
     style: Style,
     decorations: Decorations,
     maximized: bool,
+    /// The platform rounds the window's corners, so the app need not.
+    platform_rounds: bool,
     /// The system shows the app's menus, so the window need not.
     native_menus: bool,
     /// The app has been told it is ending.
@@ -49,6 +51,7 @@ impl<A: App> Ui<A> {
             style,
             decorations,
             maximized: false,
+            platform_rounds: false,
             native_menus: false,
             exited: false,
             needs_view: true,
@@ -159,6 +162,15 @@ impl<A: App> Ui<A> {
         }
     }
 
+    /// Says that the platform rounds the window's corners itself, so the
+    /// frame is drawn square and left for the platform to cut.
+    pub fn set_platform_rounds(&mut self, rounds: bool) {
+        if rounds != self.platform_rounds {
+            self.platform_rounds = rounds;
+            self.needs_view = true;
+        }
+    }
+
     /// Says that the system's menu bar shows the app's menus.
     pub fn set_native_menus(&mut self, native: bool) {
         if native != self.native_menus {
@@ -251,7 +263,7 @@ impl<A: App> Ui<A> {
         if self.needs_view {
             let bare = self.app.window_state().bare;
             let title_bar = self.decorations == Decorations::Custom && !bare;
-            let chrome = Chrome { title: self.app.title(), title_bar, rounded: title_bar && !self.maximized, background: !bare, menu_bar: !self.native_menus && !bare };
+            let chrome = Chrome { title: self.app.title(), title_bar, rounded: title_bar && !self.maximized && !self.platform_rounds, background: !bare, menu_bar: !self.native_menus && !bare };
             let mut root = self.app.frame(self.app.view(), chrome);
             let mut pass = IdPass::default();
             root.assign_ids(WidgetId(1), 0, &mut pass);
