@@ -100,6 +100,16 @@ pub struct Renderer {
 impl Renderer {
     /// `fonts` are the typefaces text is drawn with.
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, fonts: crate::Fonts) -> Self {
+        let mut renderer = Self::without_text(device, queue);
+        renderer.set_text(TextSystem::new(fonts));
+        renderer
+    }
+
+    /// A renderer with no fonts yet, to be given them with
+    /// [`Renderer::set_text`]. Making a renderer compiles its shaders,
+    /// the slowest part of opening a window, so a window has it made on
+    /// another thread while it loads the fonts and lays out its first frame.
+    pub fn without_text(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("armature shapes"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/shape.wgsl"))),
@@ -181,7 +191,7 @@ impl Renderer {
             0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
             4 => Float32x4, 5 => Float32x4, 6 => Float32x4
         ];
-        let shape_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let shape_pipeline = || device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("armature shapes"),
             layout: Some(&shape_layout),
             vertex: wgpu::VertexState {
@@ -213,8 +223,6 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-
-        let images = crate::image::ImageRenderer::new(&device, &globals_bgl, premultiplied, CANVAS_FORMAT);
 
         let instance_capacity = 1024;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -282,8 +290,26 @@ impl Renderer {
                 cache: None,
             })
         };
-        let blur_down = blur_pipeline("fs_down");
-        let blur_up = blur_pipeline("fs_up");
+        // Each pipeline compiles its shaders, which on Direct3D takes up to a
+        // tenth of a second apiece; made side by side they take as long as
+        // the slowest. Text's is made now too, rather than in the first frame.
+        let (shape_pipeline, images, blur_down, blur_up, (viewport, atlas, text_renderer)) = std::thread::scope(|s| {
+            let shape = s.spawn(shape_pipeline);
+            let images = s.spawn(|| crate::image::ImageRenderer::new(&device, &globals_bgl, premultiplied, CANVAS_FORMAT));
+            let down = s.spawn(|| blur_pipeline("fs_down"));
+            let up = s.spawn(|| blur_pipeline("fs_up"));
+            let text = s.spawn(|| {
+                let glyph_cache = Cache::new(&device);
+                let viewport = Viewport::new(&device, &glyph_cache);
+                let mut atlas = TextAtlas::with_color_mode(&device, &queue, &glyph_cache, CANVAS_FORMAT, ColorMode::Web);
+                let renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+                (viewport, atlas, renderer)
+            });
+            fn join<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+                h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+            }
+            (join(shape), join(images), join(down), join(up), join(text))
+        });
         let blur_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("armature blur params"),
             size: BLUR_SLOT * BLUR_SLOTS,
@@ -306,10 +332,6 @@ impl Renderer {
             }],
         });
 
-        let glyph_cache = Cache::new(&device);
-        let viewport = Viewport::new(&device, &glyph_cache);
-        let atlas = TextAtlas::with_color_mode(&device, &queue, &glyph_cache, CANVAS_FORMAT, ColorMode::Web);
-
         Self {
             device,
             queue,
@@ -330,11 +352,11 @@ impl Renderer {
             blit_shader,
             blit_pipelines: vec![],
             canvas: None,
-            text: TextSystem::new(fonts),
+            text: TextSystem::empty(),
             swash: SwashCache::new(),
             viewport,
             atlas,
-            text_renderers: vec![],
+            text_renderers: vec![text_renderer],
             images,
         }
     }
@@ -366,6 +388,12 @@ impl Renderer {
     /// The font database and text-layout cache.
     pub fn text(&mut self) -> &mut TextSystem {
         &mut self.text
+    }
+
+    /// Gives the renderer the fonts text is drawn with, for one made
+    /// [`Renderer::without_text`].
+    pub fn set_text(&mut self, text: TextSystem) {
+        self.text = text;
     }
 
     fn ensure_canvas(&mut self, width: u32, height: u32) {
