@@ -4,17 +4,141 @@ use winit::window::Window;
 
 /// Starts a system drag of `paths` from the window, so they can be dropped
 /// on other apps. Call it while the pointer event that began the drag is
-/// being handled. Returns false where this is not supported yet: everywhere
-/// but macOS.
+/// being handled. Returns false where this is not supported yet: Linux.
+/// On Windows it returns only once the files have been let go.
 pub(crate) fn drag_files(window: &Window, paths: &[std::path::PathBuf]) -> bool {
     #[cfg(target_os = "macos")]
     {
         macos::drag_files(window, paths)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_drag::drag_files(window, paths)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (window, paths);
         false
+    }
+}
+
+/// Takes a window out of sight now, as the system has it, whatever winit
+/// believes: see `Shell::keep_hidden`.
+pub(crate) fn hide_now(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = window.window_handle()
+            && let RawWindowHandle::Win32(h) = handle.as_raw()
+        {
+            // SAFETY: a plain call with the window's own handle.
+            unsafe {
+                let _ = ShowWindow(HWND(h.hwnd.get() as _), SW_HIDE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    window.set_visible(false);
+}
+
+#[cfg(target_os = "windows")]
+mod windows_drag {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoTaskMemFree, IDataObject};
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{BHID_DataObject, IShellItemArray, SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHParseDisplayName};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    /// The files go as Explorer's own do, in the shell's data object, so
+    /// whatever takes a drag from Explorer takes this; and the shell runs
+    /// the drag, with its pictures of what is carried.
+    pub(super) fn drag_files(window: &winit::window::Window, paths: &[std::path::PathBuf]) -> bool {
+        let Ok(handle) = window.window_handle() else { return false };
+        let RawWindowHandle::Win32(h) = handle.as_raw() else { return false };
+        let hwnd = HWND(h.hwnd.get() as _);
+        let Some(data) = data_object(paths) else { return false };
+        // SAFETY: on the window's thread, where winit has started OLE for
+        // dropping files, while the button that began the drag is down.
+        unsafe { SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK).is_ok() }
+    }
+
+    pub(super) fn pointer_position(window: &winit::window::Window) -> Option<armature_render::Point> {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::Win32(h) = handle.as_raw() else { return None };
+        let mut p = POINT::default();
+        // SAFETY: plain calls with a valid window and a point to write to.
+        unsafe { (GetCursorPos(&mut p).is_ok() && ScreenToClient(HWND(h.hwnd.get() as _), &mut p).as_bool()).then_some(())? };
+        let scale = window.scale_factor() as f32;
+        Some(armature_render::Point::new(p.x as f32 / scale, p.y as f32 / scale))
+    }
+
+    /// The shell's data object for the files at `paths`, those it can find.
+    pub(super) fn data_object(paths: &[std::path::PathBuf]) -> Option<IDataObject> {
+        // SAFETY: each item list the shell makes is freed below, after the
+        // array made from it has copied it.
+        unsafe {
+            let mut lists: Vec<*mut ITEMIDLIST> = vec![];
+            for path in paths {
+                let mut list = std::ptr::null_mut();
+                if SHParseDisplayName(PCWSTR(HSTRING::from(path.as_os_str()).as_ptr()), None, &mut list, 0, None).is_ok() {
+                    lists.push(list);
+                }
+            }
+            let shared: Vec<*const ITEMIDLIST> = lists.iter().map(|l| l.cast_const()).collect();
+            let data = (!shared.is_empty())
+                .then(|| SHCreateShellItemArrayFromIDLists(&shared).ok())
+                .flatten()
+                .and_then(|items: IShellItemArray| items.BindToHandler::<_, IDataObject>(None, &BHID_DataObject).ok());
+            for list in lists {
+                CoTaskMemFree(Some(list.cast_const().cast()));
+            }
+            data
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+        use windows::Win32::System::Ole::{OleInitialize, ReleaseStgMedium, CF_HDROP};
+        use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+        #[test]
+        fn files_go_as_explorer_gives_them() {
+            let dir = std::env::temp_dir().join(format!("armature-drag-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let paths = [dir.join("a clip.mp4"), dir.join("b.txt")];
+            for p in &paths {
+                std::fs::write(p, b"x").unwrap();
+            }
+            // SAFETY: OLE started for this thread; the medium is let go after it is read.
+            let found = unsafe {
+                let _ = OleInitialize(None);
+                let data = super::data_object(&paths).expect("a data object");
+                let format = FORMATETC { cfFormat: CF_HDROP.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+                let mut medium = data.GetData(&format).expect("a list of files, as other apps read them");
+                let drop = HDROP(medium.u.hGlobal.0);
+                let count = DragQueryFileW(drop, u32::MAX, None);
+                let found: Vec<std::path::PathBuf> = (0..count)
+                    .map(|i| {
+                        let mut name = vec![0u16; 1024];
+                        let n = DragQueryFileW(drop, i, Some(&mut name)) as usize;
+                        String::from_utf16_lossy(&name[..n]).into()
+                    })
+                    .collect();
+                ReleaseStgMedium(&mut medium);
+                found
+            };
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(found, paths);
+            assert!(super::data_object(&[dir.join("gone")]).is_none(), "nothing to carry");
+        }
     }
 }
 
@@ -34,7 +158,11 @@ pub(crate) fn pointer_position(window: &Window) -> Option<armature_render::Point
     {
         macos::pointer_position(window)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_drag::pointer_position(window)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = window;
         None

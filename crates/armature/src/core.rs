@@ -199,7 +199,8 @@ impl Limits {
 pub enum WindowRequest {
     /// Start a system drag of these files, so they can be dropped on other
     /// apps. Raise it while handling the pointer movement that began the
-    /// drag. Only macOS supports it so far.
+    /// drag. macOS and Windows support it; on Windows the request returns
+    /// only once the files have been let go.
     DragFiles(Vec<std::path::PathBuf>),
     Drag,
     Resize(ResizeEdge),
