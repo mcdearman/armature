@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use armature_render::{wgpu, Point, Renderer, Size, SurfaceTarget};
+use armature_render::{wgpu, Point, Renderer, Scene, Size, SurfaceTarget, TextSystem};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -15,6 +15,71 @@ use crate::app::{App, Decorations, Scheme};
 use crate::core::{CursorIcon, ResizeEdge, WindowRequest};
 use crate::event::{Event, Key, KeyEvent, Modifiers, PointerButton};
 use crate::runtime::Ui;
+
+/// When `ARMATURE_STARTUP` names a file, how long each step of opening
+/// the window took is added to it, timed from `run`; and with
+/// `ARMATURE_STARTUP_PROBE` set the app quits once its first frame is
+/// drawn, before the window is shown. For finding what keeps a window
+/// from its first frame.
+static STARTUP: std::sync::OnceLock<Option<(Instant, std::sync::Mutex<std::fs::File>)>> = std::sync::OnceLock::new();
+
+fn startup_mark(what: &str) {
+    let Some(Some((began, out))) = STARTUP.get() else { return };
+    if let Ok(mut out) = out.lock() {
+        use std::io::Write;
+        let _ = writeln!(out, "{:>8.1} ms  {what}", began.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+fn startup_probe() -> bool {
+    std::env::var_os("ARMATURE_STARTUP_PROBE").is_some()
+}
+
+/// What the shell has lately done to its window, each with when: kept so
+/// that a window found in sight against the app's wish (see
+/// `Shell::keep_hidden`) can be written down with what came just before it.
+static MARKS: std::sync::Mutex<std::collections::VecDeque<(std::time::SystemTime, String)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn mark(what: impl Into<String>) {
+    if let Ok(mut marks) = MARKS.lock() {
+        if marks.len() == 24 {
+            marks.pop_front();
+        }
+        marks.push_back((std::time::SystemTime::now(), what.into()));
+    }
+}
+
+/// Whether the step called `what` is to be done: `ARMATURE_SKIP` lists, by
+/// comma, steps to leave out, for finding which of them a fault follows
+/// (blur, blur-strength, corners, square, level, size, position, protect,
+/// title, focus). Marked either way.
+fn step(what: &str) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| std::env::var("ARMATURE_SKIP").map(|v| v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default());
+    let skipped = skip.iter().any(|s| s == what);
+    mark(if skipped { format!("{what} (skipped)") } else { what.to_owned() });
+    !skipped
+}
+
+/// Writes down a window found in sight that the app has hidden, with the
+/// last things done to it, in `ARMATURE_GHOST_LOG` or the system's temporary
+/// folder's `armature-ghosts.log`.
+fn log_ghost(title: &str, window: &Window) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now();
+    let path = std::env::var_os("ARMATURE_GHOST_LOG").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("armature-ghosts.log"));
+    let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    let unix = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let (pos, size) = (window.outer_position().ok(), window.outer_size());
+    let _ = writeln!(out, "ghost: '{title}' (process {}) found in sight while hidden, at unix ms {unix}; window at {pos:?}, {}x{}", std::process::id(), size.width, size.height);
+    let _ = writeln!(out, "  what came before it, oldest first:");
+    if let Ok(marks) = MARKS.lock() {
+        for (at, what) in marks.iter() {
+            let ago = now.duration_since(*at).map_or(0, |d| d.as_millis());
+            let _ = writeln!(out, "    {ago:>8} ms before  {what}");
+        }
+    }
+}
 
 /// Errors that stop an application from starting.
 #[derive(Debug)]
@@ -62,7 +127,22 @@ pub fn on_menu_chosen(heard: impl Fn(&str) + Send + Sync + 'static) {
 
 /// Opens a window and runs `app` until it closes.
 pub fn run<A: App>(app: A) -> Result<(), Error> {
+    STARTUP.get_or_init(|| {
+        let path = std::env::var_os("ARMATURE_STARTUP")?;
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some((Instant::now(), std::sync::Mutex::new(out)))
+    });
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
+    startup_mark("event loop");
+    // The adapter is sought while the window is made and the fonts loaded.
+    let plain = app.wanted_features(wgpu::Features::all()).is_empty();
+    let display = event_loop.owned_display_handle();
+    let early = std::thread::spawn(move || {
+        let instance = graphics_instance(display, plain);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        startup_mark(&format!("adapter ({:?})", adapter.get_info().backend));
+        Some((instance, adapter))
+    });
     let settings = app.window();
     let mut ui = Ui::new(app, settings.size, Scheme::Light);
     let waker = event_loop.create_proxy();
@@ -92,9 +172,11 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         }));
         rx
     };
+    startup_mark("app started");
     if let Ok(mut clipboard) = arboard::Clipboard::new() {
         ui.set_clipboard_reader(Box::new(move || clipboard.get_text().ok()));
     }
+    startup_mark("clipboard");
     let mut shell = Shell {
         ui,
         settings,
@@ -110,7 +192,13 @@ pub fn run<A: App>(app: A) -> Result<(), Error> {
         captured: false,
         unseen_at: None,
         hidden: false,
+        unshown: cfg!(target_os = "windows"),
+        show_pending: false,
+        shown_once: !cfg!(target_os = "windows"),
+        early: Some(early),
+        first: None,
         retry_at: None,
+        owed: false,
         state: None,
         resizing: None,
         dropped: vec![],
@@ -159,9 +247,34 @@ struct Shell<A: App> {
     /// The window is fully covered, minimised or on a sleeping display, so
     /// nothing is drawn until it is visible again.
     hidden: bool,
+    /// The window is out of sight and, when the app next wants it seen, is
+    /// to be drawn before it is shown. On Windows a window shown before
+    /// its first frame is an empty one: the backdrop alone, a flat grey
+    /// box for a glass window, for as long as the frame takes, and one
+    /// shown again after being hidden holds whatever it last drew. So
+    /// there it is drawn while still hidden and shown with the frame in it.
+    unshown: bool,
+    /// The app wants the window seen and it has not been drawn for that yet.
+    show_pending: bool,
+    /// The window has been in sight at least once. On Windows its glass and
+    /// rounded corners wait for that: the compositor draws them for a window
+    /// never yet shown, empty and at twice its place and size, as grey boxes
+    /// over the screen (found 2026-11-14 by leaving each step out in turn;
+    /// either alone draws its part of the box, and neither, nothing).
+    shown_once: bool,
+    /// The graphics instance and adapter, being found on another thread
+    /// while the window is made.
+    early: Option<std::thread::JoinHandle<Option<(wgpu::Instance, wgpu::Adapter)>>>,
+    /// The first frame, laid out while the renderer's shaders compiled,
+    /// and the size and scale it was laid out for.
+    first: Option<(Scene, (u32, u32), f32)>,
     /// The surface had no frame to give; try again at this time rather than
     /// straight away, which would spin a processor core.
     retry_at: Option<Instant>,
+    /// A frame was wanted and could not be drawn, so one is owed whether or
+    /// not the app has anything new: a window shown with its first frame
+    /// lost would otherwise stay empty until something happened in it.
+    owed: bool,
     /// The app's window state as last applied to the window.
     state: Option<crate::app::WindowState>,
     /// An edge drag the framework is carrying out itself, where the platform cannot.
@@ -184,6 +297,55 @@ struct ManualResize {
     size: (f64, f64),
 }
 
+/// Where a window is on the screen, and the screen it is on.
+fn geometry_of(window: &Window) -> crate::app::WindowGeometry {
+    let scale = window.scale_factor() as f32;
+    let size = window.inner_size();
+    // Wayland does not tell clients where their windows are.
+    let pos = window.inner_position().unwrap_or_default();
+    let frame = armature_render::Rect::new(pos.x as f32 / scale, pos.y as f32 / scale, size.width as f32 / scale, size.height as f32 / scale);
+    let screen = window.current_monitor().map_or(frame, |m| {
+        let (p, s) = (m.position(), m.size());
+        armature_render::Rect::new(p.x as f32 / scale, p.y as f32 / scale, s.width as f32 / scale, s.height as f32 / scale)
+    });
+    crate::app::WindowGeometry { frame, screen, scale }
+}
+
+/// The graphics instance a window is drawn with. `plain` is for an app
+/// that asks nothing of the device beyond what every one has.
+fn graphics_instance(display: winit::event_loop::OwnedDisplayHandle, plain: bool) -> wgpu::Instance {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut instance = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display));
+    #[cfg(target_os = "windows")]
+    {
+        // Where Direct3D is what draws, its usual swapchain, made from the
+        // window, is opaque. One made from a composition visual is
+        // see-through, as a bare window and a glass one need.
+        instance.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        // And Direct3D opens a window sooner than Vulkan: 415 ms to NeoCal's
+        // first frame against 670 (2026-10-16), mostly in making Vulkan's
+        // instance and swapchain. An app that asks more of the device, a
+        // game say, is left to wgpu's own choice, which it was tried on.
+        if plain {
+            instance.backends = wgpu::Backends::DX12;
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = plain;
+    // `WGPU_BACKEND` and its like choose what draws, for trying another.
+    wgpu::Instance::new(instance.with_env())
+}
+
+/// An instance, a surface for `window` and an adapter that can draw on it,
+/// from whatever wgpu would choose: for when the one found early cannot.
+fn find_adapter(event_loop: &ActiveEventLoop, window: &Arc<Window>) -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter), Error> {
+    let instance = graphics_instance(event_loop.owned_display_handle(), false);
+    let surface = instance.create_surface(window.clone()).map_err(|e| Error::Graphics(e.to_string()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() }))
+        .map_err(|e| Error::Graphics(format!("no GPU adapter: {e}")))?;
+    Ok((instance, surface, adapter))
+}
+
 fn scheme_of(t: winit::window::Theme) -> Scheme {
     match t {
         winit::window::Theme::Dark => Scheme::Dark,
@@ -200,8 +362,9 @@ impl<A: App> Shell<A> {
             .with_transparent(true)
             .with_decorations(s.decorations == Decorations::System)
             .with_resizable(s.resizable)
-            // An app that starts in the background never flashes a window.
-            .with_visible(self.ui.window_state().visible);
+            // An app that starts in the background never flashes a window;
+            // and on Windows none is shown before it has been drawn (see `unshown`).
+            .with_visible(self.ui.window_state().visible && !self.unshown);
         if let Some(m) = s.min_size {
             attrs = attrs.with_min_inner_size(LogicalSize::new(m.w as f64, m.h as f64));
         }
@@ -227,37 +390,63 @@ impl<A: App> Shell<A> {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs = attrs.with_no_redirection_bitmap(true).with_skip_taskbar(s.skip_taskbar);
         }
+        startup_mark("resumed");
+        mark(format!("making the window, visible {}", self.ui.window_state().visible && !self.unshown));
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| Error::Graphics(e.to_string()))?);
+        mark("window made");
+        startup_mark("window made");
         if let Some(t) = window.theme() {
             self.ui.set_system_scheme(scheme_of(t));
         }
         if s.decorations == Decorations::Custom {
-            self.ui.set_platform_rounds(crate::platform::round_corners(&window, true));
+            // Whether the system rounds windows here, asked with the corners
+            // this one has anyway; it is rounded when first shown. See `shown_once`.
+            if step("corners") {
+                self.ui.set_platform_rounds(crate::platform::round_corners(&window, !cfg!(target_os = "windows")));
+            }
         }
 
-        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
-        let mut instance = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle()));
-        // Where Direct3D is what draws, its usual swapchain, made from the
-        // window, is opaque. One made from a composition visual is
-        // see-through, as a bare window and a glass one need.
-        #[cfg(target_os = "windows")]
-        {
-            instance.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
-        }
-        // `WGPU_BACKEND` and its like choose what draws, for trying another.
-        let instance = wgpu::Instance::new(instance.with_env());
-        let surface = instance.create_surface(window.clone()).map_err(|e| Error::Graphics(e.to_string()))?;
-        let (adapter, device, queue) = pollster::block_on(async {
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })
-                .await
-                .map_err(|e| Error::Graphics(format!("no GPU adapter: {e}")))?;
-            // With whatever the app wants of what this adapter has.
-            let app = self.ui.app();
-            let descriptor = wgpu::DeviceDescriptor { required_features: app.wanted_features(adapter.features()) & adapter.features(), required_limits: app.wanted_limits(&adapter.limits()), ..Default::default() };
-            let (device, queue) = adapter.request_device(&descriptor).await.map_err(|e| Error::Graphics(e.to_string()))?;
-            Ok::<_, Error>((adapter, device, queue))
-        })?;
+        // Loaded while the adapter is sought.
+        let mut text = TextSystem::new(self.ui.app().fonts());
+        startup_mark("fonts");
+        text.warm();
+        startup_mark("fonts warmed");
+        let (instance, surface, adapter) = match self.early.take().and_then(|h| h.join().ok()).flatten() {
+            Some((instance, adapter)) => {
+                let surface = instance.create_surface(window.clone()).map_err(|e| Error::Graphics(e.to_string()))?;
+                if adapter.is_surface_supported(&surface) {
+                    (instance, surface, adapter)
+                } else {
+                    drop(surface);
+                    find_adapter(event_loop, &window)?
+                }
+            }
+            None => find_adapter(event_loop, &window)?,
+        };
+        startup_mark("surface");
+
+        // With whatever the app wants of what this adapter has.
+        let app = self.ui.app();
+        let descriptor = wgpu::DeviceDescriptor { required_features: app.wanted_features(adapter.features()) & adapter.features(), required_limits: app.wanted_limits(&adapter.limits()), ..Default::default() };
+        // The device is made and the renderer's shaders compiled on another
+        // thread, while here the surface is set up and the first frame laid out.
+        let (sent, device) = std::sync::mpsc::channel();
+        let making = {
+            let adapter = adapter.clone();
+            std::thread::spawn(move || -> Result<Renderer, String> {
+                let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| e.to_string())?;
+                let _ = sent.send((device.clone(), queue.clone()));
+                Ok(Renderer::without_text(device, queue))
+            })
+        };
+        let made = |making: std::thread::JoinHandle<Result<Renderer, String>>| match making.join() {
+            Ok(made) => made.map_err(Error::Graphics),
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let Ok((device, queue)) = device.recv() else {
+            return Err(made(making).err().unwrap_or_else(|| Error::Graphics("no graphics device".into())));
+        };
+        startup_mark("device");
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).or_else(|| caps.formats.first().copied()).ok_or_else(|| Error::Graphics("surface has no formats".into()))?;
@@ -283,13 +472,24 @@ impl<A: App> Shell<A> {
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
+        startup_mark("surface configured");
         let scale = window.scale_factor() as f32;
         self.ui.resize(Size::new(size.width as f32 / scale, size.height as f32 / scale));
         self.ui.set_scale(scale);
+        self.ui.window_geometry(geometry_of(&window));
         // Before the first view: an app that draws with the device has it by then.
         self.ui.graphics(&crate::app::Graphics::of(&device, &queue));
+        if self.ui.window_state().visible {
+            let now = Instant::now();
+            self.ui.step(now);
+            self.first = Some((self.ui.draw(&mut text, now), (config.width, config.height), scale));
+            startup_mark("first frame laid out");
+        }
+        let mut renderer = made(making)?;
+        renderer.set_text(text);
+        startup_mark("renderer");
         self.gpu = Some(Gpu {
-            renderer: Renderer::new(device, queue, self.ui.app().fonts()),
+            renderer,
             surface,
             config,
             target: SurfaceTarget { format, unpremultiply },
@@ -304,16 +504,92 @@ impl<A: App> Shell<A> {
         Ok(())
     }
 
-    /// Applies style-driven window state such as backdrop blur.
+    /// Puts a window the app has out of sight back out of sight, when
+    /// something else has shown it. Seen at login on Windows and macOS: the
+    /// tray apps' hidden windows came up as empty glass, never drawn, since
+    /// the app believed them hidden, and never hidden again, since to the
+    /// app nothing had changed. What shows them is not known; a window
+    /// coming into sight is asked to paint, which is when this is called.
+    fn keep_hidden(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        if self.state.is_some_and(|s| !s.visible) && gpu.window.is_visible() == Some(true) {
+            log_ghost(&self.ui.title(), &gpu.window);
+            mark("hidden again");
+            // winit keeps its own note of whether the window is shown and, on
+            // Windows, never learns that something else showed it: there its
+            // `set_visible(false)` sees nothing to change and does nothing.
+            crate::platform::hide_now(&gpu.window);
+            self.unshown = cfg!(target_os = "windows");
+        }
+    }
+
+    /// Applies style-driven window state such as backdrop blur, and shows
+    /// a window that was waiting to be drawn first.
     fn sync_window(&mut self) {
+        self.sync_window_state();
+        if std::mem::take(&mut self.show_pending) {
+            // Drawn while still out of sight, which no paint message would
+            // ask for; then shown with that frame in it. Shown all the same
+            // if the frame could not be had, and drawn as soon as it can be.
+            self.render();
+            startup_mark("first frame, hidden");
+            if startup_probe() {
+                self.close = true;
+                return;
+            }
+            self.unshown = false;
+            self.shown_once = true;
+            self.sync_glass();
+            if let Some(gpu) = &self.gpu {
+                mark("show, drawn first");
+                gpu.window.set_visible(true);
+                if self.state.is_some_and(|s| !s.passive) && step("focus") {
+                    gpu.window.focus_window();
+                }
+                gpu.window.request_redraw();
+            }
+            // And once more now that it is in sight: what was drawn while
+            // it was hidden is not always what the system puts up first
+            // (measured: a tenth of a second of empty window without this).
+            self.render();
+            startup_mark("shown and drawn again");
+        }
+    }
+
+    /// The system's glass behind the window and its rounded corners, as the
+    /// app's style asks; on Windows only once the window has been in sight.
+    fn sync_glass(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        if !self.shown_once {
+            return;
+        }
+        let state = self.ui.window_state();
+        // Platform blur would fill a see-through window.
+        let glass = (self.ui.backdrop_blur().is_some() && !state.bare, if state.bare { 0.0 } else { self.ui.window_radius() });
+        if self.glass != Some(glass) {
+            if step("blur") {
+                crate::platform::set_blur(&gpu.window, glass.0, glass.1);
+            }
+            // A window with the system's own frame keeps the system's corners.
+            if self.settings.decorations == Decorations::Custom && step("corners") {
+                crate::platform::round_corners(&gpu.window, glass.1 > 0.0);
+            }
+            self.glass = Some(glass);
+            self.blur_strength = None;
+            self.blur_attempts = 0;
+        }
+    }
+
+    fn sync_window_state(&mut self) {
         let Some(gpu) = &self.gpu else { return };
         let state = self.ui.window_state();
         if self.state != Some(state) {
             let old = self.state.replace(state);
-            if old.map(|o| o.always_on_top) != Some(state.always_on_top) {
+            mark(format!("app wants: visible {}, on top {}, bare {}, passive {}", state.visible, state.always_on_top, state.bare, state.passive));
+            if old.map(|o| o.always_on_top) != Some(state.always_on_top) && step("level") {
                 gpu.window.set_window_level(if state.always_on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
             }
-            if old.map(|o| o.bare) != Some(state.bare) {
+            if old.map(|o| o.bare) != Some(state.bare) && step("square") {
                 // A see-through window's shadow would outline whatever it draws.
                 #[cfg(target_os = "macos")]
                 {
@@ -324,43 +600,44 @@ impl<A: App> Shell<A> {
             }
             if old.and_then(|o| o.size) != state.size
                 && let Some(s) = state.size
+                && step("size")
             {
                 let _ = gpu.window.request_inner_size(LogicalSize::new(s.w as f64, s.h as f64));
             }
             if old.and_then(|o| o.position) != state.position
                 && let Some(p) = state.position
+                && step("position")
             {
                 gpu.window.set_outer_position(winit::dpi::LogicalPosition::new(p.x as f64, p.y as f64));
             }
-            if old.map(|o| o.hidden_from_capture) != Some(state.hidden_from_capture) {
+            if old.map(|o| o.hidden_from_capture) != Some(state.hidden_from_capture) && step("protect") {
                 gpu.window.set_content_protected(state.hidden_from_capture);
             }
-            if old.map(|o| o.visible) != Some(state.visible) {
+            if old.map(|o| o.visible) != Some(state.visible) && state.visible && self.unshown {
+                // Not yet: drawn first. See `sync_window`.
+                self.show_pending = true;
+            } else if old.map(|o| o.visible) != Some(state.visible) {
+                mark(if state.visible { "show" } else { "hide" });
+                self.shown_once |= state.visible;
                 gpu.window.set_visible(state.visible);
+                // Hidden, it is to be drawn afresh before it is next seen.
+                if !state.visible {
+                    self.unshown = cfg!(target_os = "windows");
+                }
                 if state.visible {
                     // Windows shown from a global shortcut should come to the
                     // front; ones that appear on their own should not take over.
-                    if !state.passive {
+                    if !state.passive && step("focus") {
                         gpu.window.focus_window();
                     }
                     gpu.window.request_redraw();
                 }
             }
         }
-        // Platform blur would fill a see-through window.
-        let glass = (self.ui.backdrop_blur().is_some() && !state.bare, if state.bare { 0.0 } else { self.ui.window_radius() });
-        if self.glass != Some(glass) {
-            crate::platform::set_blur(&gpu.window, glass.0, glass.1);
-            // A window with the system's own frame keeps the system's corners.
-            if self.settings.decorations == Decorations::Custom {
-                crate::platform::round_corners(&gpu.window, glass.1 > 0.0);
-            }
-            self.glass = Some(glass);
-            self.blur_strength = None;
-            self.blur_attempts = 0;
-        }
+        self.sync_glass();
+        let Some(gpu) = &self.gpu else { return };
         let title = self.ui.title();
-        if gpu.window.title() != title {
+        if gpu.window.title() != title && step("title") {
             gpu.window.set_title(&title);
         }
     }
@@ -437,7 +714,9 @@ impl<A: App> Shell<A> {
         if self.blur_strength == Some(want) {
             return;
         }
-        if crate::platform::set_blur_strength(&gpu.window, want) {
+        if !step("blur-strength") {
+            self.blur_strength = Some(want);
+        } else if crate::platform::set_blur_strength(&gpu.window, want) {
             self.blur_strength = Some(want);
         } else if self.blur_attempts < 60 {
             // The system builds its glass layers after a display pass.
@@ -456,23 +735,19 @@ impl<A: App> Shell<A> {
     /// Tells the app where its window is on the screen.
     fn report_frame(&mut self) {
         let Some(gpu) = &self.gpu else { return };
-        let scale = gpu.window.scale_factor() as f32;
-        let size = gpu.window.inner_size();
-        // Wayland does not tell clients where their windows are.
-        let pos = gpu.window.inner_position().unwrap_or_default();
-        let frame = armature_render::Rect::new(pos.x as f32 / scale, pos.y as f32 / scale, size.width as f32 / scale, size.height as f32 / scale);
-        let screen = gpu.window.current_monitor().map_or(frame, |m| {
-            let (p, s) = (m.position(), m.size());
-            armature_render::Rect::new(p.x as f32 / scale, p.y as f32 / scale, s.width as f32 / scale, s.height as f32 / scale)
-        });
-        self.ui.window_geometry(crate::app::WindowGeometry { frame, screen, scale });
+        self.ui.window_geometry(geometry_of(&gpu.window));
     }
 
     fn render(&mut self) {
-        if self.hidden || self.state.is_some_and(|s| !s.visible) {
+        if self.state.is_some_and(|s| !s.visible) {
+            return;
+        }
+        if self.hidden {
+            self.owed = true;
             return;
         }
         let Some(gpu) = &mut self.gpu else { return };
+        self.owed = true;
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             status @ (wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded) => {
@@ -498,20 +773,36 @@ impl<A: App> Shell<A> {
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 eprintln!("armature: surface validation error");
+                // Not asked for again and again: that would never end.
+                self.owed = false;
                 return;
             }
         };
-        self.retry_at = None;
+        (self.retry_at, self.owed) = (None, false);
+        if self.unshown {
+            startup_mark("surface texture");
+        }
         let scale = gpu.window.scale_factor() as f32;
         self.ui.set_scale(scale);
         // The app's own frame first, so that what is shown is this one's.
         let now = Instant::now();
-        self.ui.step(now);
-        let scene = self.ui.draw(gpu.renderer.text(), now);
+        let scene = match self.first.take() {
+            Some((scene, size, at)) if size == (gpu.config.width, gpu.config.height) && at == scale => scene,
+            _ => {
+                self.ui.step(now);
+                self.ui.draw(gpu.renderer.text(), now)
+            }
+        };
+        if self.unshown {
+            startup_mark("view laid out and drawn");
+        }
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         gpu.window.pre_present_notify();
         gpu.renderer.render(&scene, &view, gpu.target, gpu.config.width, gpu.config.height, scale);
         gpu.renderer.queue().present(frame);
+        if self.unshown {
+            startup_mark("rendered and presented");
+        }
         // Widgets may copy while laying out (for example Vim yanks).
         if let Some(t) = self.ui.take_clipboard()
             && let Some(c) = &mut self.clipboard {
@@ -578,7 +869,7 @@ impl<A: App> Shell<A> {
         gpu.window.set_cursor(cursor_icon(self.ui.cursor()));
         self.sync_window();
         if let Some(gpu) = &self.gpu
-            && self.ui.needs_redraw()
+            && (self.ui.needs_redraw() || self.owed)
             && self.can_draw() {
                 gpu.window.request_redraw();
             }
@@ -751,6 +1042,7 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 gpu.window.request_redraw();
             }
             WindowEvent::Occluded(hidden) => {
+                mark(if hidden { "system: occluded" } else { "system: in sight" });
                 self.hidden = hidden;
                 if !hidden {
                     self.retry_at = None;
@@ -764,6 +1056,7 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 self.after_input();
             }
             WindowEvent::Focused(f) => {
+                mark(if f { "system: focused" } else { "system: not focused" });
                 self.blur_strength = None;
                 self.blur_attempts = 0;
                 // The pointer is not kept from someone who has gone elsewhere.
@@ -775,7 +1068,10 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 }
                 self.dispatch(Event::WindowFocus(f));
             }
-            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::RedrawRequested => {
+                self.keep_hidden();
+                self.render();
+            }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
                 let mods = self.modifiers();
@@ -862,12 +1158,23 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 let Some(pos) = self.pointer else { return };
                 self.dispatch(Event::Pinch { pos, factor: (1.0 + delta as f32).max(0.1) });
             }
+            // A window that comes to the front is told of every key still held
+            // as though just pressed: the Enter that chose something in a window
+            // that then went away would act again in the one beneath. Releases
+            // made up as a window loses the keys are kept, so none stays held.
+            WindowEvent::KeyboardInput { event, is_synthetic: true, .. } if event.state == ElementState::Pressed => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 let modifiers = self.modifiers();
                 let key = map_key(&event.logical_key);
                 if modifiers.command() && key == Key::Character("v".into()) {
                     let text = self.clipboard.as_mut().and_then(|c| c.get_text().ok());
+                    // Nothing a text field can take: the app may know what to do with it.
+                    let nothing_to_type = text.as_deref().is_none_or(str::is_empty);
                     self.ui.set_clipboard(text);
+                    if nothing_to_type && event.state == ElementState::Pressed && !event.repeat {
+                        self.ui.pasted_without_text();
+                        self.after_input();
+                    }
                 }
                 self.dispatch(Event::Key(KeyEvent {
                     key,
@@ -900,6 +1207,7 @@ impl<A: App> ApplicationHandler for Shell<A> {
         }
         #[cfg(target_os = "macos")]
         if REOPENED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            mark("system: asked to open again");
             self.ui.reopened();
         }
         let now = Instant::now();
@@ -908,7 +1216,7 @@ impl<A: App> ApplicationHandler for Shell<A> {
             self.retry_at = None;
         }
         if let Some(gpu) = &self.gpu
-            && self.ui.needs_redraw()
+            && (self.ui.needs_redraw() || self.owed)
             && self.can_draw() {
                 gpu.window.request_redraw();
             }
@@ -928,6 +1236,7 @@ impl<A: App> ApplicationHandler for Shell<A> {
             self.unseen_at = None;
         }
         self.sync_window();
+        self.keep_hidden();
         if self.close || self.ui.should_exit() {
             event_loop.exit();
             return;
