@@ -133,6 +133,14 @@ pub trait App: 'static {
         None
     }
 
+    /// Called when the paste shortcut is pressed and the clipboard holds
+    /// no text: a picture, perhaps, or files, which a text field can do
+    /// nothing with. An app that can use those looks at the clipboard
+    /// itself and returns a message to act on it.
+    fn on_paste_without_text(&self) -> Option<Self::Message> {
+        None
+    }
+
     /// Called when the window moves or changes size, with where it is on
     /// the screen.
     fn on_window_geometry(&self, _geometry: WindowGeometry) -> Option<Self::Message> {

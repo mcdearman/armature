@@ -135,6 +135,14 @@ impl<A: App> Ui<A> {
         }
     }
 
+    /// Tells the app the paste shortcut was pressed with no text to paste.
+    pub fn pasted_without_text(&mut self) {
+        if let Some(m) = self.app.on_paste_without_text() {
+            self.app.update(m);
+            self.needs_view = true;
+        }
+    }
+
     /// Tells the app where its window is on the screen.
     pub fn window_geometry(&mut self, geometry: crate::app::WindowGeometry) {
         if let Some(m) = self.app.on_window_geometry(geometry) {
