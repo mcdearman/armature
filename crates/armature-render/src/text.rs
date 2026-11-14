@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight, Wrap};
 
@@ -76,7 +76,7 @@ impl<'a> Span<'a> {
 /// Shaped text, cheap to clone.
 #[derive(Clone)]
 pub struct TextLayout {
-    pub(crate) buffer: Rc<Buffer>,
+    pub(crate) buffer: Arc<Buffer>,
     size: Size,
     line_height: f32,
 }
@@ -190,6 +190,28 @@ impl TextSystem {
         Self { fonts, names, cache: HashMap::new(), frame: 0 }
     }
 
+    /// Reads the typefaces in, which is otherwise done the first time each
+    /// is drawn with, and so in a window's first frame: for a window to do
+    /// while it waits on the graphics device.
+    pub fn warm(&mut self) {
+        let sample = "The quick brown fox jumps over the lazy dog 0123456789 .,:;!?()[]+−×÷=%√π…";
+        for family in [FontFamily::Sans, FontFamily::Mono] {
+            for weight in [400, 500, 600, 700] {
+                self.layout(sample, &TextStyle { weight, family, ..Default::default() }, None);
+            }
+        }
+        if !self.names.icons.is_empty() {
+            self.layout("\u{e000}", &TextStyle { family: FontFamily::Icons, ..Default::default() }, None);
+        }
+    }
+
+    /// One with no fonts at all, which loads nothing: a stand-in until
+    /// the real one is ready. See [`crate::Renderer::without_text`].
+    pub fn empty() -> Self {
+        let fonts = FontSystem::new_with_locale_and_db("en-US".into(), glyphon::fontdb::Database::new());
+        Self { fonts, names: Fonts::default(), cache: HashMap::new(), frame: 0 }
+    }
+
     /// Shapes `text`, wrapping at `max_width` when given.
     pub fn layout(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> TextLayout {
         self.layout_inner(text, &[], style, max_width)
@@ -280,7 +302,7 @@ impl TextSystem {
         }
         let lines = lines.max(1);
         let layout = TextLayout {
-            buffer: Rc::new(buffer),
+            buffer: Arc::new(buffer),
             size: Size::new(w.ceil().max(0.0), line_height * lines as f32),
             line_height,
         };
